@@ -1,0 +1,4265 @@
+#--------------------------
+# 2026 05 22 version v8.10 (audit + correctifs testCursor)
+#/****************************************************************
+# *
+# *   ███████╗██████╗ ██╗  ██╗██╗██████╗ ██╗████████╗
+# *   ██╔════╝██╔══██╗██║  ██║██║██╔══██╗██║╚══██╔══╝
+# *   ███████╗██████╔╝███████║██║██████╔╝██║   ██║
+# *   ╚════██║██╔═══╝ ██╔══██║██║██╔══██╗██║   ██║
+# *   ███████║██║     ██║  ██║██║██║  ██║██║   ██║
+# *   ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝╚═╝   ╚═╝
+# *
+# *   Smooth Particle Hydrodynamics
+# *   Integrated Resource for Instruction and Teaching
+# *
+# *   Educational & Research CFD Platform
+# *
+# ****************************************************************/
+import numpy as np
+import os
+from scipy.spatial import cKDTree
+import shutil
+# bodyF
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+
+#****************************************************************
+# Masse conservation (no variation) and no volume variation
+# ALE formulation
+# Ordre 2 in time and space with MLS and Renormalization for div operator 
+# Five tests cas  : 
+#                   jet impact, impact of a column of water on a plate or deux jets impacted
+#                   funnel , vsicosity study via water release Funnel Discharge Benchmark (FDB)
+#                   DamBreak, ALE, L dambreak
+#                   TGV, : ALE,El L vortex preservation
+#                   car (FSI)  : full lagrangian interaction between a car (VBL) and a water tank
+#                   floating body  https://www.spheric-sph.org/tests/test-12
+#                   Test mesh mouvement (no Euler or Navier-Stokes resolution only mesh displacement) : based on TGV
+# ---- TO-DO--------------
+#  geométrie du BodyF qui est à revoir (Lucylle et Denis)
+#  protocole funnel faire avec Baptiste
+#  faire le protocole de validation DB courbe analytique ref Martinand Moyce  et Koshizuka
+#  faire convergence TGV eulerian, lagrangian log-log
+#  shifting ++
+#  theorical aspect
+# --------------------------  
+# Structure du code
+#1. Paramètres physiques et numériques per testcase
+#2. Fonctions SPH (kernel, gradient, pression, densité, Riemann)
+#3. Fonctions ALE (entropie, v_mesh)
+#4. Initialisation maillage + particules
+#5. Boucle temporelle :
+  # a) Mise à jour conditions aux frontières fantômes
+ #  b) Calculs Shepard ou RENORM / ALE / v_mesh
+ #  c) Calculs flux massiques et accélérations
+ #  d) Mise à jour rho, vel, pos
+ #  e) Calcul dt CFL
+  # f) Sauvegarde VTK
+# ------------------------
+# Biblio 
+#test case TGV and jet2D in https://www.sciencedirect.com/science/article/pii/S0045782523002839
+#test case DamBreak  https://www.spheric-sph.org/tests/test-02 et https://www.tandfonline.com/doi/full/10.1080/21664250.2019.1672124?utm_source=chatgpt.com#d1e3653
+#test case funnel https://cdn.standards.iteh.ai/samples/73851/ccc06afc20a046ac83a46e30264f221c/ISO-2431-2019.pdf
+#test case car
+# --------------------------
+ModeDEBUG = False #Only for unitaire test (RENORM, MLS etc) — True = tests MLS/Renorm
+testCase = 'DamBreak' #jet or car or funnel or DamBreak or TGV (selection) or TGVmesh or bodyF
+mesh_mode = 'lagrangian' #eulerian ale lagrangian
+# Paramètres ALE (géometrie distribution)
+mode_ale = 'wass' #wass (Wasserstein norm) or grad (PU based and centroid) or classic (shepard based)
+#Modes :
+#      'lloyd'   : descente F1 seul (terme dominant Lloyd)
+#      'wass'    : descente F1 complet (avec correction ordre 2)  
+#      'shepard' : descente F_S seul (correction Shepard)
+#      'coupled' : descente F2 = F1 + alpha*F_S  ← NOUVEAU
+beta_geom=0.001 #scalar for ALE velocity
+alpha = 0.01 # Variation in 0.1 or 1 or 10
+#*****************Précision spatiale ***************************
+mode_p_refinement = 0 # 0 default ordre 0 or Use MLS gradient reconstruction ordre 1
+#*****************Précision temporelle ***************************
+mode_RK= 1 # Use Euler  (1) or RK2 (2)  temporal integration
+
+# --------------------------
+# CONFIGURATION UTILISATEUR
+# --------------------------
+#Paramètre de la simulation
+ViscoONOFF = False #Add visco physic based Morris 
+ShiftPart = False  # Add shift particule 
+randompos = True # add random pos pos to avoid artificial artefact numerical
+randomlength=0.1
+ShepardCorr = False #add a sheaprd correction for gradient SPH
+RenormON = True #Matrice Renorm Consistance 1 Vila only if p=0 (incompatibilty with MLS)
+Filtre = False #Filtrage density to avoid frees surface expansion
+stepfiltre = 1 #every step for filtrage
+endfiltreiteration = 1000 #fin du filtrage en iterations
+save= 50 #nombres d'itération avant une sauvegarde
+# ------------------------
+#SAVE WRITE
+print("\n Ecriture fichier")
+vtk_dir = f"{testCase}{mesh_mode}{mode_ale}{mode_p_refinement}Renorm{RenormON}dx"
+if os.path.exists(vtk_dir):
+    shutil.rmtree(vtk_dir)  # Supprime le dossier et tout son contenu
+os.makedirs(vtk_dir, exist_ok=True)
+# --------------------------
+# Paramètres Physiques
+# --------------------------
+rho0 = 1000.0
+mu = 1.0  # Viscosité dynamique (Pa.s)
+g_acc = 9.81
+H_column = 0.04  #0.0821 m à terme
+#c0 = 10.0 * np.sqrt(g_acc * H_column)
+c0 = 10.0 * np.sqrt(g_acc * 0.0621)
+gamma = 7.0
+B = (rho0 * c0**2) / gamma
+g = np.array([0.0, -g_acc])
+n_layers = 5  # Nombre de couches pour l'épaisseur du mur (min 3 pour SPH)
+dx = 0.001  #default value
+h = 1.2 * dx  # default value
+CFL = 0.1     # 0.01 est très lent, 0.1 est plus standard avec Riemann
+FLUID, WALL = 0, 1
+R_top = 0.8
+R_bottom = 0.15
+
+if testCase == 'bodyF':
+    # ==============================================================================
+    # 1.  PARAMÈTRES DU CAS TEST
+    # ==============================================================================
+
+    # ---- Choix de la résolution ----
+    # dx = 0.005   # Haute résolution  (~600k particules, ~24h de calcul)
+    # dx = 0.01    # Résolution standard (~150k particules, ~4h de calcul)
+    dx = 0.02      # Résolution pédagogique (~12k particules, ~15min)   ← défaut
+
+    # ---- Types de particules ----
+    FLUID, WALL, FLAP, BODY = 0, 1, 2, 3
+
+    # ---- Physique de base ----
+    rho0    = 1000.0            # densité eau  [kg/m³]
+    g_acc   = 9.81              # pesanteur    [m/s²]
+    g       = np.array([0.0, -g_acc])
+
+    # ---- Géométrie du bassin ----
+    H_water = 0.90              # profondeur eau au repos [m]
+    L_tank  = 4.00              # longueur du bassin      [m]
+
+    # ---- Corps flottant (section 2D) ----
+    L_body  = 0.10              # longueur        [m]
+    H_body  = 0.05              # hauteur         [m]
+    rho_rel = 0.68              # densité relative (ρ_corps / ρ_eau)
+    rho_body = rho_rel * rho0   # densité absolue [kg/m³] = 680
+
+    #  En 2D, on travaille par unité de largeur (largeur réelle = 0.29 m)
+    mass_body_2D = rho_body * L_body * H_body           # [kg/m] = 3.4 kg/m
+    I_body_2D    = (mass_body_2D / 12.0) * (L_body**2 + H_body**2)  # [kg.m²/m]
+
+    x_body_init = 2.11                          # distance clapet→centre corps [m]
+    draft       = rho_rel * H_body              # tirant d'eau = 0.034 m
+    y_body_init = H_water - draft + H_body/2.0  # hauteur du centre de masse = 0.891 m
+
+    print(f"Corps flottant : L={L_body*100:.0f}cm × H={H_body*100:.0f}cm")
+    print(f"Tirant d'eau   : d = {draft*100:.1f} cm")
+    print(f"Centre de masse: ({x_body_init:.3f}, {y_body_init:.3f}) m")
+    print(f"Masse 2D       : {mass_body_2D:.3f} kg/m")
+    print(f"Inertie 2D     : {I_body_2D*1e4:.3f} kg.cm².m")
+
+    # ---- Sondes de mesure ----
+    x_probe1 = 1.16     # sonde 1 : avant le corps  [m]
+    x_probe2 = 2.66     # sonde 2 : après le corps  [m]
+
+    # ---- Paramètres SPH ----
+    h    = 1.2 * dx
+    c0   = 10.0 * np.sqrt(g_acc * H_water)   # ≈ 29.7 m/s
+    gamma = 7.0
+    B    = rho0 * c0**2 / gamma
+    CFL  = 0.05
+    mu   = 1.0e-3                              # viscosité dynamique eau [Pa.s]
+    ViscoONOFF  = False
+    ShepardCorr = False
+    n_layers    = 3
+    mode_RK     = 1                            # intégration RK2
+    finaltime   = 50.0                         # durée totale [s]
+    save        = 100                          # fréquence VTK
+    Periodic    = False
+
+    print(f"\nSPH : dx={dx:.3f}m  h={h:.4f}m  c0={c0:.2f}m/s")
+    print(f"Nombre approx. de particules fluides : {int(L_tank*H_water/dx**2)}")
+
+    
+    
+
+if testCase == 'car':
+    # longueurs horizontales
+    L_plateau = 4.0       # plateau gauche
+    L_slope = 3.2         # pente descendante
+    L_bottom = 7.6        # plateau fond
+    L_rise = 3.2          # remontée
+    L_plateau_right = 4.0 # plateau final
+    finaltime = 8
+    # angles
+    theta_deg = 18.02       # Angle pente
+    theta = np.radians(theta_deg)
+    H_water =0.3    
+    # Paramètres du quai
+    L_quay = 1.0  # Longueur du quai à gauche
+    H_quay = H_water  # Le quai est légèrement au-dessus de l'eau
+    posXinitCar =1.2
+    posYinitCar = H_quay+1.1
+    c0 = 10.0 * np.sqrt(g_acc * H_water)
+    gamma = 7.0
+    B = (rho0 * c0**2) / gamma
+    g = np.array([0.0, -g_acc])
+    dx = 0.1
+    h = 1.2 * dx
+    CFL = 0.05
+    # Types de particules
+    FLUID, WALL, CAR = 0, 1, 2
+    car_mass = 4400
+    carvitesse = 1
+    Periodic = False #only for TGV false for else testcase
+    R_car = dx   # rayon voiture
+    R_wall =dx # rayon mur
+    # 4. Paramètres physiques WALL-CAR
+    dtcrtq = CFL * h / (c0 +  carvitesse)  #$dt$ doit être beaucoup plus petit que cette période (typiquement $dt < T/10$
+    k = 0.0001*car_mass/( dtcrtq / 0.2)**2   # Raideur du ressort
+    damping = 50 #2*(car_mass*k)**0.5 #50.0 # Amortissement
+
+if testCase == 'TGV' or testCase == 'TGVmesh' :
+    # ---------------------------
+    TYPE_FLUID = 1
+    TYPE_GHOST = 2
+    L = 1.0
+    rho0 = 1.0
+    U0 = 1.0
+    c0 = 10.0 * U0
+    nu = 0.01
+    mu = rho0 * nu
+    gamma = 7.0
+    B = (rho0 * c0**2) / gamma
+    dx = 0.04
+    h = 2.0 * dx
+    CFL = 0.01
+    finaltime = 8
+    g = np.array([0.0, 0.0])
+    Periodic = True
+    t_star =0.01
+    if testCase =='TGVmesh': mode_RK = 1
+    #tree = cKDTree(pos, boxsize=L)
+    
+if testCase == 'funnel':
+    rho0 = 1285.0
+    H_column = 0.04 #0.0821 m à terme  //0.04 en mode degradé
+    # --- Paramètres de l'entonnoir ---
+    H_funnel = H_column
+    space = 1
+    R_top = 0.8
+    R_bottom = 0.15
+    mu = 1.0  # Viscosité dynamique (Pa.s)
+    #L_column = 1  # 1 m à terme
+    #c0 = 10.0 * np.sqrt(g_acc * H_column)
+    c0 = 15.0 * np.sqrt(g_acc * H_column) #1 bon pour dx =0.001
+    gamma = 7.0
+    B = (rho0 * c0**2) / gamma
+    dx = 0.001  #0.0001 à terme   
+    h = 1.3 * dx  # Un h trop grand (2*dx) augmente trop la pression locale
+    noise_amp = 0.05 * dx  #scalar for random pos [0.001; 0.15] 
+    finaltime = 1
+    Periodic = False #only for TGV false for else testcase
+    Initcase = False
+
+if testCase == 'DamBreak':
+    H_column = 2  #2 m à terme
+    L_column = 1  # 1 m à terme
+    c0 = 10.0 * np.sqrt(g_acc * H_column)
+    gamma = 7.0
+    B = (rho0 * c0**2) / gamma
+    dx = 0.04  # 0.04 Dambreak de base 
+    h = 2.0 * dx  # Un h trop grand (2*dx) augmente trop la pression locale
+    noise_amp = 0.05 * dx  #scalar for random pos [0.001; 0.15] 
+    finaltime = 8
+    Periodic = False #only for TGV false for else testcase
+        
+    
+if testCase == 'jet':
+    print("\n Initialisation0")
+    #----------jet test case 
+    dx = 0.01  #0.01 à terme  funnel 0.001 basic  and for jet 0.02 and 0.04 Dambreak
+    h = 1.2 * dx  # Un h trop grand (2*dx) augmente trop la pression locale
+    noise_amp = 0.05 * dx  #scalar for random pos [0.001; 0.15] 
+    g = np.array([0.0, 0.0])
+    v_jet = 1
+    c0 = v_jet * 20
+    gamma = 7.0
+    B = (rho0 * c0**2) / gamma
+    DOUBLE_JET = False
+    # Pré-remplissage fluide
+    N_layers = 50            # nombre de couches de fluide après chaque buffer
+    impact_gap = 2 * dx       # espace vide au centre pour retarder l'impact
+    # Types
+    FLUID, WALL, GHOST, BUFFER_TOP, BUFFER_BOTTOM = 0, 1, 2, 3, 4
+    # Géométrie
+    jet_x_min, jet_x_max = 0.45, 0.55
+    y_center, gap = 0.25, 0.05
+    y_inlet_top = y_center + gap
+    y_inlet_bottom = y_center - gap
+    finaltime = 8
+    Periodic = False #only for TGV false for else testcase
+
+
+# Note : Pour un Reynolds très faible (fluide très visqueux), 
+# testez avec mu = 0.1 ou 1.0.
+# --------------------------
+# Fonctions SPH & VTK
+# --------------------------
+def update_neighborhood(new_pos, h):
+    # On reconstruit l'arbre avec les positions actuelles
+    new_tree = cKDTree(new_pos)
+    # On cherche les paires de particules à une distance d'influence (souvent 2h ou 3h)
+    new_pairs = new_tree.query_pairs(r=2.0 * h) # Adapte le rayon selon ton noyau
+    return new_tree, new_pairs
+def kernel_cubic(r, h):
+    q = r / h
+    sigma = 10.0 / (7.0 * np.pi * h**2)
+    return np.where(q <= 1.0, sigma * (1 - 1.5*q**2 + 0.75*q**3), 
+           np.where(q <= 2.0, sigma * 0.25 * (2 - q)**3, 0.0))
+
+def kernel_grad(rij, r, h):
+    q = r / h
+    sigma_g = 10.0 / (7.0 * np.pi * h**3)
+    dw_r = np.where(q <= 1.0, sigma_g * (-3.0*q + 2.25*q**2),
+           np.where(q <= 2.0, -sigma_g * 0.75 * (2.0 - q)**2, 0.0))
+    return (dw_r / (r + 1e-12)) * rij, dw_r
+
+# À définir dans vos paramètres globaux (ex: égale à la pression hydrostatique max)
+# P_b = rho0 * g_acc * H_water 
+P_b = 0.01 * B # Une fraction de B fonctionne souvent très bien en WCSPH
+
+def get_pressure(rho):
+    # L'équation de Tait avec la pression de fond
+    p_tait = B * (np.power(rho / rho0, gamma) - 1.0)
+    
+    # On garantit que la pression totale absolue reste positive
+    p_total = p_tait + P_b
+    
+    return np.maximum(p_total, 0.0) 
+
+def get_density(p):
+    # Il faut soustraire la pression de fond pour retrouver la composante Tait pure
+    # avant d'inverser l'équation
+    p_dynamic = p - P_b
+    p_clamped = np.clip(p_dynamic, -0.9*B, 5.0*rho0*c0**2)
+    
+    return rho0 * np.power(np.maximum((p_clamped / B) + 1.0, 1e-6), 1.0 / gamma)
+
+def minmod_vec(a, b):
+    # Version vectorisée pour Numpy
+    res = np.zeros_like(a)
+    mask = a * b > 0
+    res[mask] = np.sign(a[mask]) * np.minimum(np.abs(a[mask]), np.abs(b[mask]))
+    return res
+
+def minmod(a, b):
+    if a*b <= 0:
+        return 0
+    else:
+        return np.sign(a) * min(abs(a), abs(b))   
+        
+def van_albada(a, b):
+    """Forme symétrique : prend deux pentes a et b et renvoie la pente limitée."""
+    eps = 1e-12
+    #if a * b <= 0.0:
+       # return 0.0  # Signes opposés = extremum local = ordre 1 (pente nulle)
+    return 1.0#(a * (b**2 + eps) + b * (a**2 + eps)) / (a**2 + b**2 + 2.0 * eps)
+    
+def riemann_solver(rhoL, uL, pL, rhoR, uR, pR, c0, P_b):
+    #Solveur Rusanov / Local Lax–Friedrichs linéarisé (forme acoustique)
+    rho_avg = 0.5 * (rhoL + rhoR)
+    #if rho_avg < 1e-6: return 0.5 * (uL + uR), 0.5 * (pL + pR)
+    beta = 0.5 
+    pL_dyn, pR_dyn = pL - P_b, pR - P_b
+    p_star_dyn = 0.5*(pL_dyn + pR_dyn) - beta * rho_avg * c0 * (uR - uL)
+    u_star = 0.5*(uL + uR)         - beta * (pR_dyn - pL_dyn) / (rho_avg*c0 + 1e-12)    
+    # On rajoute P_b pour renvoyer une pression TOTALE absolue
+    p_star = p_star_dyn + P_b 
+    return u_star, p_star
+
+def get_tgv_solution(pos, t, L, U0, nu):
+    k = 2 * np.pi / L
+    decay = np.exp(-2 * k**2 * nu * t)
+    u =  U0 * np.sin(k*pos[:,0]) * np.cos(k*pos[:,1]) * decay
+    v = -U0 * np.cos(k*pos[:,0]) * np.sin(k*pos[:,1]) * decay
+    p = (rho0 * U0**2 / 4.0) * (np.cos(2*k*pos[:,0]) + np.cos(2*k*pos[:,1])) * decay**2
+    return np.column_stack((u, v)), p
+# --------------------------
+# Périodicité
+# --------------------------
+
+def periodic_rij(xi,xj):
+
+    rij=xi-xj
+    rij-=L*np.round(rij/L)
+
+    return rij
+
+
+def compute_v_mesh_full(pos, vel_f, vol_f, h, dt,  mode,shepard, tree, pairs):
+    n_p = len(pos)
+    FS = np.zeros_like(pos)  
+    F1 = np.zeros_like(pos) 
+    F2 = np.zeros_like(pos)  
+    # Calcul v_mesh selon le mode
+    if mode == 'lagrangian':
+        
+        return vel_f.copy(), np.zeros(n_p), np.zeros(n_p), np.zeros((n_p,2)), np.zeros((n_p,2))
+    if mode == 'eulerian':
+        v_mesh = np.zeros_like(vel_f)
+        return v_mesh, np.zeros(n_p), np.zeros(n_p), np.zeros((n_p,2)), np.zeros((n_p,2))
+    if mode == 'ale':         
+        v_mesh, F1, FS, F2, grad_W2, grad_FS, lloyd_shift = compute_v_mesh_coupled(pos, vel_f, vol_f, h, dt, shepard, tree, pairs,
+                           alpha, beta_geom, mode_ale)        
+        
+    return v_mesh, F1, FS, grad_W2, grad_FS
+    
+def compute_renormalization_matrices_robust(pairs, pos, vol, h, shepard_coeff, L_matrices):
+    """
+    Calcule Li avec régularisation pour les particules en surface libre
+    ou avec un support pauvre.
+    """
+    num_particles = pos.shape[0]
+    M = np.zeros((num_particles, 2, 2))
+    cond_array = np.ones(num_particles)
+    renorm_status = np.zeros(num_particles, dtype=int) # 0 par défaut
+    I2 = np.eye(2)
+    
+    # 1. Accumulation de la matrice M (Identique à précédemment)
+    for i, j in pairs:
+        rij = periodic_rij(pos[i], pos[j]) if Periodic else pos[i] - pos[j]
+        r = np.linalg.norm(rij)
+        if r < 1e-12 or r > 2.0 * h: continue
+
+        g_w, _ = kernel_grad(rij, r, h)
+        
+        M[i] += vol[j] * np.outer(-rij, g_w)
+        M[j] += vol[i] * np.outer(rij, -g_w)
+
+    # 2. Inversion avec vigilance (Surface Libre & Conditionnement)
+    for i in range(num_particles):
+        # On utilise le coefficient de Shepard pour détecter le manque de voisins
+        # Une particule complète a shepard_coeff ~ 1.0
+        s_i = shepard_coeff[i]
+        
+        det = np.linalg.det(M[i])
+        cond_number = 0.0        
+
+        # CRITÈRES DE VIGILANCE :
+        # - Déterminant trop petit
+        # - Nombre de conditionnement trop grand (> 100)
+        # - Coefficient de Shepard trop faible (particule isolée < 0.2)   
+        if abs(det) > 1e-15:
+            norm_M = np.linalg.norm(M[i])
+            norm_invM = np.linalg.norm(np.linalg.inv(M[i]))
+            cond_i = norm_M * norm_invM
+            cond_array[i] = cond_i 
+        else:
+            cond_array[i] = 1e6 # Valeur arbitraire haute pour signaler une singularité    
+         # Choix de la branche
+        if s_i < 0.2 or abs(det) < 1e-7 or cond_array[i] > 100.0:
+            epsilon = max(0, 0.5 - s_i)
+            L_matrices[i] = np.linalg.inv(M[i] + epsilon * np.eye(2))
+            renorm_status[i] = 1 # Régularisé
+        else:
+            L_matrices[i] = np.linalg.inv(M[i])
+            renorm_status[i] = 2 # Full Renorm
+            
+    return cond_array, renorm_status   
+            
+def add_periodic_ghosts(pos, types, h, L):
+    """Ajoute des copies fantômes pour compléter le support aux bords"""
+    idx_boundary = (pos[:, 0] < h) | (pos[:, 0] > L - h)
+    
+    if not np.any(idx_boundary):
+        return pos, types
+    
+    # Copies en (-L, y) et (L, y)
+    pos_left = pos[idx_boundary].copy()
+    pos_left[:, 0] -= L
+    
+    pos_right = pos[idx_boundary].copy()
+    pos_right[:, 0] += L
+    
+    pos_extended = np.vstack([pos, pos_left, pos_right])
+    types_extended = np.concatenate([types, types[idx_boundary], types[idx_boundary]])
+    
+    return pos_extended, types_extended            
+            
+# --------------------------
+# Entropie géométrique
+# --------------------------
+def compute_geometric_entropy(pos, vol, h,shepard):          
+    S_G_local = (shepard - 1)**2   
+    return S_G_local, np.mean(S_G_local)
+# --------------------------
+# Entropie de distribution compute_distribution_entropy(pos, vol_f, h,shepard,tree,pairs)
+# --------------------------
+def compute_distribution_entropy(pos, vol, h,shepard, tree,pairs):
+    n_p = len(pos)    
+    S_dist = -np.sum(0.0)       
+    grad_S_dist = np.zeros_like(pos)   
+    for i, j in pairs:
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]
+        r = np.linalg.norm(rij)
+        if r < 1e-12: continue 
+        grad_S_dist[i] = 0.0
+    return grad_S_dist, S_dist
+
+def compute_wasserstein_shift(pos, vol, h, tree, pairs):   
+    n = len(pos)
+    # On initialise des accumulateurs pour le centre de gravité
+    num_centroid = np.zeros((n, 2))
+    den_centroid = np.zeros(n)    
+    # On parcourt les paires pour accumuler les poids
+    for i, j in pairs:
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]
+        r = np.linalg.norm(rij)
+        
+        if r < 1e-12 or r > 2*h: continue 
+        
+        W = kernel_cubic(r, h)
+        weight = W * vol[j]
+        
+        # Accumulation pour la particule i
+        num_centroid[i] += pos[j] * weight
+        den_centroid[i] += weight
+        
+        # Accumulation pour la particule j (symétrie)
+        # On utilise vol[i] pour la contribution de i sur j
+        weight_rev = W * vol[i]
+        num_centroid[j] += pos[i] * weight_rev
+        den_centroid[j] += weight_rev
+
+    # Calcul final du shift : (Centroïde - Position Actuelle)
+    shift = np.zeros_like(pos)
+    # On ne calcule que là où il y a des voisins pour éviter div par 0
+    mask = den_centroid > 1e-12
+    
+    # Formule : Shift = (Somme(pos_j * W_ij * V_j) / Somme(W_ij * V_j)) - pos_i
+    centroid = num_centroid[mask] / den_centroid[mask][:, None]
+    shift[mask] = centroid - pos[mask]
+    
+    return shift
+   
+
+def compute_mls_gradients_order2(pos, vol, field, h, tree):
+    """MLS d'ordre 2 avec base {1, x, y, x², xy, y²}"""
+    n_p = len(pos)
+    dim = 2
+    n_basis = 6  # 1, x, y, x², xy, y²
+    gradients = np.zeros((n_p, dim))
+    
+    for i in range(n_p):
+        idx = tree.query_ball_point(pos[i], 2*h)
+        if len(idx) < n_basis:
+            continue
+        
+        rij = pos[idx] - pos[i]
+        r = np.linalg.norm(rij, axis=1)
+        valid = r > 1e-12
+        
+        # Construction de la base polynomiale P
+        x, y = rij[valid, 0], rij[valid, 1]
+        P = np.column_stack([
+            np.ones_like(x),
+            x, y,
+            x**2, x*y, y**2
+        ])  # Shape: (K, 6)
+        
+        # Poids
+        W = kernel_cubic(r[valid], h)
+        weight = W * vol[idx[valid]]
+        
+        # Matrice de moment : M = P^T @ diag(W) @ P
+        M = P.T @ (weight[:, None] * P)
+        
+        # RHS
+        df = field[idx[valid]] - field[i]
+        rhs = P.T @ (weight * df)
+        
+        # Résolution
+        try:
+            inv_M = np.linalg.pinv(M)
+            coeffs = inv_M @ rhs
+            gradients[i] = coeffs[1:3]  # Extraire ∇ (indices 1,2)
+        except np.linalg.LinAlgError:
+            pass
+    
+    return gradients
+
+
+
+
+
+def compute_mls_gradients(pos, vol, field, h, tree,p_ref,cond_MLS):
+    """
+    Calcule le gradient d'un champ (scalaire ou vecteur) via Moving Least Squares.
+    Version Vectorisée et corrigée (Signe mathématique exact).
+    """
+    n_p = len(pos)
+    dim = pos.shape[1]
+    
+    
+    
+    # Si field est scalaire (n,), on le reshape en (n,1)
+    f_is_scalar = (field.ndim == 1)
+    f = field[:, None] if f_is_scalar else field
+    n_components = f.shape[1]
+    
+    gradients = np.zeros((n_p, n_components, dim))
+    
+    for i in range(n_p):       
+        idx = tree.query_ball_point(pos[i], 2*h)
+        
+        # S'il n'y a pas assez de voisins pour calculer un gradient (particule isolée)
+        if len(idx) < dim + 1:
+            continue
+            
+        if Periodic:
+            # Assure-toi que periodic_rij renvoie bien pos[idx] - pos[i]
+            # Si ta fonction fait l'inverse, rajoute un signe "-"
+            rij = (-periodic_rij(pos[i], pos[idx]) )
+        else:
+            # CORRECTION CRITIQUE : Vecteur pointant de i vers j (xj - xi)
+            rij = (pos[idx] - pos[i])
+            
+        r = np.linalg.norm(rij, axis=1)
+        
+        # Éviter l'auto-interaction avec une distance nulle (division par 0 potentielle)
+        valid = r > 1e-12
+        if not np.any(valid):
+            continue
+            
+        idx = np.array(idx)[valid]
+        rij = rij[valid]
+        r = r[valid]
+        
+        # Poids SPH
+        W = kernel_cubic(r, h)
+        weight = W * vol[idx]  # Shape: (K,)
+        
+        # -- VECTORISATION --
+        # Matrice de Moment M : Somme( weight * rij * rij^T )
+        # (dim, K) @ (K, dim) -> (dim, dim)
+        M = ((rij * weight[:, None]).T @ rij)/(h**2)
+        M += 1e-12 * np.eye(dim)
+        # Différence de champ : f_j - f_i
+        df = f[idx] - f[i]  # Shape: (K, n_components)
+        
+        # Vecteur RHS : Somme( weight * df * rij^T )
+        # (n_components, K) @ (K, dim) -> (n_components, dim)
+        rhs = df.T @ (rij/h * weight[:, None])
+        
+        if (types[i] == FLUID) : 
+            # Résolution du système M * grad = rhs
+            try:
+                cond_MLS[i] = np.linalg.cond(M) 
+                # np.linalg.pinv est parfait ici (gère les matrices mal conditionnées)
+                inv_M = np.linalg.pinv(M)
+                gradients[i] = (rhs @ inv_M)/h
+                p_ref[i] = 1                      
+                
+            except np.linalg.LinAlgError:
+                gradients[i] = 0.0
+                p_ref[i] = 0
+                cond_MLS[i] = np.inf # Indique un conditionnement infini (
+
+    # Si c'était un scalaire, on renvoie (N, dim) au lieu de (N, 1, dim)
+    return gradients[:, 0, :] if f_is_scalar else gradients
+
+
+def add_position_noise(points, amplitude):
+    r = amplitude * np.sqrt(np.random.rand(len(points)))
+    theta = 2*np.pi*np.random.rand(len(points))
+    noise = np.column_stack((r*np.cos(theta), r*np.sin(theta)))
+    return points + noise
+
+def smoothstep(a,b,y):
+    t=np.clip((y-a)/(b-a),0,1)
+    return t*t*(3-2*t)
+
+def get_funnel_radius(y):
+    y1 = 0.020
+    y2 = 0.0321
+    if y < y1:
+        return 0.003
+    elif y < y2:
+        s = smoothstep(y1,y2,y)
+        return (1-s)*0.003 + s*0.025
+    else:
+        return 0.025
+
+def get_funnel_derivative(y):
+    y1=0.020
+    y2=0.0321
+    if y<y1 or y>y2:
+        return 0.0
+    t=(y-y1)/(y2-y1)
+    ds=6*t*(1-t)/(y2-y1)
+    return (0.025-0.003)*ds
+# --------------------------
+def compute_energy_functionals(pos, vol, h, shepard, pairs):
+    """
+    Calcule F1 (Wasserstein-2), F_S (Shepard defect), F2 = F1 + alpha*F_S.
+    Retourne également le gradient complet pour la descente.
+    """
+    n = len(pos)
+    
+    # --- Terme F_S : défaut de Shepard ---
+    F_S = 0.5 * np.sum(vol * (shepard - 1.0)**2)
+    
+    # --- Terme F_1 : Wasserstein-2 centroïdal ---
+    F_1 = 0.0
+    num_c = np.zeros((n, 2))  # numérateur centroïde
+    den_c = np.zeros(n)       # = shepard (vérification)
+    variance_dist = np.zeros(n)  # variance locale des |x_ij|^2
+
+    for i, j in pairs:
+        
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]
+            
+        r = np.linalg.norm(rij)
+        if r < 1e-12 or r > 2*h: continue
+        
+        W = kernel_cubic(r, h)
+        r2 = r * r
+        
+        # Contributions centroïde pour i (utilisation de j)
+        num_c[i] += pos[j] * W * vol[j]
+        den_c[i] += W * vol[j]
+        variance_dist[i] += W * vol[j] * r2
+        
+        # Contributions centroïde pour j (utilisation de i)
+        num_c[j] += pos[i] * W * vol[i]
+        den_c[j] += W * vol[i]
+        variance_dist[j] += W * vol[i] * r2
+
+    # Centroïdes et shift de Lloyd
+    mask = den_c > 1e-12
+    centroid = np.where(mask[:, None], num_c / np.where(mask[:, None], den_c[:, None], 1), pos)
+    lloyd_shift = pos - centroid  # = x_i - c_i
+    
+    # F_1 = (1/2) * sum_i (variance_dist[i] / sigma_i)
+    F_1 = 0.5 * np.sum(
+        np.where(mask, variance_dist / np.where(mask, den_c, 1), 0.0)
+    )
+    
+    return F_1, F_S, lloyd_shift, centroid, variance_dist
+
+def compute_grad_shepard_corrected(pos, vol, h, shepard, pairs):
+    """
+    Gradient de F_S = (1/2) * sum_i V_i * (sigma_i - 1)^2
+    CORRIGÉ : inclut le facteur V_i manquant.
+    grad_FS[i] = V_i * sum_j V_j * [(sigma_i-1) + (sigma_j-1)] * grad_W_ij
+    """
+    n = len(pos)
+    grad_FS = np.zeros_like(pos)
+    error = shepard - 1.0  # sigma_i - 1
+    
+    for i, j in pairs:
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]
+        r = np.linalg.norm(rij)
+        if r < 1e-12 or r > 2*h: continue
+        
+        gW, _ = kernel_grad(rij, r, h)
+        
+        # Facteur symétrique + facteur V_i * V_j (CORRECTION vs code actuel)
+        coeff_i = vol[i] * vol[j] * (error[i] + error[j])
+        
+        grad_FS[i] += coeff_i * gW
+        grad_FS[j] -= coeff_i * gW  # antisymétrie du grad W
+    
+    return grad_FS
+
+
+
+def compute_grad_wasserstein_full(pos, vol, h, shepard, pairs, lloyd_shift, variance_dist):
+    """
+    Gradient de F_1 incluant :
+      - Terme Lloyd : x_i - c_i
+      - Correction d'ordre 2 (terme en nabla W * |x_ij|^2)
+    """
+    n = len(pos)
+    grad_W2 = lloyd_shift.copy()  # terme dominant : x_i - c_i
+    lloyd_sq = np.sum(lloyd_shift**2, axis=1)  # |x_i - c_i|^2
+    
+    mask_sigma = shepard > 1e-12
+    inv_sigma = np.where(mask_sigma, 1.0 / np.where(mask_sigma, shepard, 1), 0.0)
+    
+    for i, j in pairs:
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]
+        r = np.linalg.norm(rij)
+        if r < 1e-12 or r > 2*h: continue
+        
+        gW, _ = kernel_grad(rij, r, h)
+        r2 = r * r
+        
+        # Correction ordre 2 pour i : (1/2*sigma_i) * V_j * nabla W_ij * (|x_ij|^2 - |c_i - x_i|^2)
+        corr2_i = 0.5 * inv_sigma[i] * vol[j] * (r2 - lloyd_sq[i]) * gW
+        grad_W2[i] += corr2_i
+        
+        # Correction ordre 2 pour j
+        corr2_j = 0.5 * inv_sigma[j] * vol[i] * (r2 - lloyd_sq[j]) * (-gW)
+        grad_W2[j] += corr2_j
+    
+    return grad_W2
+
+def compute_v_mesh_coupled(pos, vel, vol, h, dt, shepard, tree, pairs,
+                           alpha, beta_geom, mode_ale):
+    """
+    Calcule la vitesse de grille ALE basée sur la descente de gradient de F2.
+    
+    Modes :
+      'lloyd'   : descente F1 seul (terme dominant Lloyd)
+      'wass'    : descente F1 complet (avec correction ordre 2)  
+      'shepard' : descente F_S seul (correction Shepard)
+      'coupled' : descente F2 = F1 + alpha*F_S  ← NOUVEAU
+    """
+    n = len(pos)
+    v_mesh = vel.copy()
+    
+    # 1. Calcul des fonctionnelles et termes intermédiaires
+    F1, FS, lloyd_shift, centroid, variance_dist = compute_energy_functionals(
+        pos, vol, h, shepard, pairs
+    )
+    F2 = F1 + alpha * FS
+    
+    # 2. Gradient selon le mode
+    if mode_ale in ('lloyd', 'wass', 'coupled'):
+        grad_W2 = compute_grad_wasserstein_full(
+            pos, vol, h, shepard, pairs, lloyd_shift, variance_dist
+        )
+    else:
+        grad_W2 = np.zeros_like(pos)
+    
+    if mode_ale in ('shepard', 'coupled'):
+        grad_FS = compute_grad_shepard_corrected(pos, vol, h, shepard, pairs)
+    else:
+        grad_FS = np.zeros_like(pos)
+    
+    # 3. Gradient total de F2
+    grad_total = grad_W2 + alpha * grad_FS
+    
+    # 4. Normalisation locale (preserves spatial information)
+    # ||x_i - c_i|| est bornée par 2h ; normaliser par h donne un shift adimensionnel
+    norms = np.linalg.norm(grad_total, axis=1, keepdims=True)
+    h_inv_norm = norms / h  # adimensionnel
+    safe_norm = np.maximum(h_inv_norm, 1e-10)
+    direction = grad_total / safe_norm  # unité : longueur
+    
+    # 5. Vitesse de shift proportionnelle à c0 et beta_geom
+    v_shift = -beta_geom * c0 * (direction / h)  # dimension : m/s
+    
+    # 6. Application (seulement pour les particules bien supportées)
+    mask_interior = shepard > 0.5  # éviter les zones mal définies
+    v_shift[~mask_interior] *= 0.0
+    v_mesh += v_shift
+    
+    # 7. Conservation de la quantité de mouvement globale du shift
+    # (optionnel : recentrage pour éviter la dérive)
+    # momentum = np.sum(vol[:, None] * v_shift, axis=0) / np.sum(vol)
+    # v_shift -= momentum
+    
+    return v_mesh, F1, FS, F2, grad_W2, grad_FS, lloyd_shift
+
+    
+
+
+
+# --------------------------------------------------
+# Distance point → segment (pour normales)
+# --------------------------------------------------
+def distance_to_segment(p, a, b):
+    ap = p - a
+    ab = b - a
+    t = np.dot(ap, ab) / np.dot(ab, ab)
+    t = np.clip(t, 0, 1)
+    closest = a + t * ab
+    return np.linalg.norm(p - closest), closest
+
+
+
+# --------------------------------------------------
+# POINT IN POLYGON   22
+# --------------------------------------------------
+def point_in_polygon(x, y, polygon):
+    inside = False
+    j = len(polygon) - 1
+
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+
+        if ((yi > y) != (yj > y)) and \
+            (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+
+        j = i
+
+    return inside
+
+
+# --------------------------------------------------
+# AJOUT POLYGONE REMPLI
+# --------------------------------------------------
+def fill_polygon(polygon):
+
+    polygon = np.array(polygon)
+
+    xmin, ymin = polygon.min(axis=0)
+    xmax, ymax = polygon.max(axis=0)
+
+    pts = []
+
+    xs = np.arange(xmin, xmax, dx)
+    ys = np.arange(ymin, ymax, dx)
+
+    for x in xs:
+        for y in ys:
+            if point_in_polygon(x, y, polygon):
+                pts.append([x, y])
+
+    return pts
+
+
+# --------------------------------------------------
+# AJOUT ROUE (CERCLE)
+# --------------------------------------------------
+def fill_circle(cx, cy, radius):
+
+    pts = []
+
+    xs = np.arange(cx-radius, cx+radius, dx)
+    ys = np.arange(cy-radius, cy+radius, dx)
+
+    for x in xs:
+        for y in ys:
+            if (x-cx)**2 + (y-cy)**2 <= radius**2 :
+                pts.append([x, y])
+
+    return pts
+
+
+# --------------------------------------------------
+# CREATE CAR ULTRA PRÉCIS
+# --------------------------------------------------
+
+
+def create_car(center_x, center_y, mass_total):
+    # ==================================================
+    # DIMENSIONS RÉELLES & GÉNÉRATION
+    # ==================================================
+    L_total = 4.020
+    H_total = 1.785
+    
+    car_pts = []
+
+    body_polygon = [
+        (-1.80, -0.30), (-1.90,  0.40), (-1.40,  0.75), (-0.30,  0.85),
+        ( 0.60,  0.85), ( 0.90,  0.65), ( 1.50,  0.45), ( 1.90,  0.20),
+        ( 2.01, -0.10), ( 1.60, -0.35), (-1.80, -0.30)
+    ]
+    car_pts += fill_polygon(body_polygon)
+
+    wheel_radius = 0.40 
+    rear_wheel_center = (-1.10, -0.50)
+    front_wheel_center = (1.20, -0.50)
+    car_pts += fill_circle(*rear_wheel_center, wheel_radius)
+    car_pts += fill_circle(*front_wheel_center, wheel_radius)
+
+    # Suppression doublons
+    # ==================================================
+    # CORRECTION DES SUPERPOSITIONS (GRID SNAPPING)
+    # ==================================================
+    pts_array = np.array(car_pts)
+    
+    # On divise par dx, on arrondit à l'entier, et on remultiplie par dx.
+    # Cela force CHAQUE particule (roue ou carrosserie) à s'aimanter 
+    # sur les intersections d'une seule et même grille globale espacée de dx.
+    pts_snapped = np.round(pts_array / dx) * dx
+    
+    # Maintenant que tout le monde est sur la même grille, 
+    # les points superposés ont EXACTEMENT les mêmes coordonnées.
+    # On peut donc utiliser unique() pour nettoyer :
+    # (On arrondit légèrement pour éviter les erreurs flottantes de Python)
+    pts_unique = np.unique(np.round(pts_snapped, 6), axis=0)
+    pts = pts_unique.copy()
+
+    # ==================================================
+    # 1. CALCUL DES NORMALES (AVANT LE SCALING) ✅
+    # ==================================================
+    # Ici l'espacement est encore parfaitement égal à `dx`
+    pts_set = set(map(tuple, np.round(pts, 6)))
+    norms = np.zeros_like(pts)
+    centroid_temp = np.mean(pts, axis=0)
+    
+    dirs = np.array([
+        [ dx, 0], [-dx, 0], [0,  dx], [0, -dx],
+        [ dx, dx], [ dx,-dx], [-dx, dx], [-dx,-dx],
+    ])
+
+    for i, p in enumerate(pts):
+        normal = np.zeros(2)
+        for d in dirs:
+            neighbour = tuple(np.round(p + d, 6))
+            if neighbour not in pts_set:
+                normal += d
+
+        if np.linalg.norm(normal) > 0:
+            outward = p - centroid_temp
+            if np.dot(normal, outward) < 0:
+                normal *= -1
+            norms[i] = normal / np.linalg.norm(normal)
+
+    # ==================================================
+    # 2. CONVERSION ET TRANSLATION (SCALING)
+    # ==================================================
+    curr_width = np.max(pts[:,0]) - np.min(pts[:,0])
+    curr_height = np.max(pts[:,1]) - np.min(pts[:,1])
+    
+    scale_x = L_total / curr_width
+    scale_y = H_total / curr_height
+
+    # On applique le scaling aux points
+    pts[:,0] *= scale_x
+    pts[:,1] *= scale_y
+
+    # ==================================================
+    # 3. CORRECTION MATHÉMATIQUE DES NORMALES
+    # ==================================================
+    # Règle mathématique : Si on étire la géométrie d'un facteur S, 
+    # le vecteur normal doit être multiplié par l'inverse de S (1/S).
+    norms[:, 0] /= scale_x
+    norms[:, 1] /= scale_y
+    
+    # On re-normalise les vecteurs normaux (pour qu'ils aient une longueur de 1)
+    lengths = np.linalg.norm(norms, axis=1)
+    mask = lengths > 0
+    norms[mask] = norms[mask] / lengths[mask, np.newaxis]
+
+    # Translation finale
+    centroid = np.mean(pts, axis=0)
+    pts[:,0] += (center_x - centroid[0])
+    pts[:,1] += (center_y - centroid[1])
+    centroid_final = np.mean(pts, axis=0)   # recomputer APRÈS translation
+    rel = pts - centroid_final
+    # ==================================================
+    # MASSE + INERTIE
+    # ==================================================
+    m_part = mass_total / len(pts)
+  
+    inertia = np.sum(m_part * np.sum(rel**2, axis=1))
+
+    return pts, m_part, inertia, norms
+# --------------------------------------------------
+# Création véhicule polygonal
+# --------------------------------------------------
+
+def update_car_rigid_body(
+        pos,
+        vel,
+        accel,
+        m,
+        types,
+        dt,
+        car_vel,
+        car_omega,
+        car_mass,
+        car_I,
+        g):
+    """
+    Mise à jour du corps rigide 'voiture' à partir
+    des forces SPH accumulées dans accel.
+    """
+
+    # Particules appartenant à la voiture
+    mask_car = (types == CAR)
+
+    if not np.any(mask_car):
+        return car_vel, car_omega
+
+    # ----------------------------
+    # Centre de masse
+    # ----------------------------
+    car_center = np.mean(pos[mask_car], axis=0)
+
+    # ----------------------------
+    # Forces totales
+    # ----------------------------
+    forces_indiv = m[mask_car, None] * (accel[mask_car] + g)
+    total_force_car = np.sum(forces_indiv, axis=0)
+
+    # ----------------------------
+    # Moments
+    # ----------------------------
+    rel_pos = pos[mask_car] - car_center
+
+    total_torque_car = np.sum(
+        rel_pos[:, 0] * forces_indiv[:, 1]
+        - rel_pos[:, 1] * forces_indiv[:, 0]
+    )
+
+    # ----------------------------
+    # Accélérations rigides
+    # ----------------------------
+    acc_rigid = total_force_car / car_mass
+    alpha_rigid = total_torque_car / car_I
+
+    # ----------------------------
+    # Intégration vitesses rigides
+    # ----------------------------
+    car_vel += acc_rigid * dt
+    car_omega += alpha_rigid * dt
+
+    # ----------------------------
+    # Mise à jour du centre
+    # ----------------------------
+    car_center += car_vel * dt
+
+    # ----------------------------
+    # Rotation
+    # ----------------------------
+    d_theta = car_omega * dt
+
+    rot_mat = np.array([
+        [np.cos(d_theta), -np.sin(d_theta)],
+        [np.sin(d_theta),  np.cos(d_theta)]
+    ])
+
+    new_rel_pos = rel_pos @ rot_mat.T
+
+    # ----------------------------
+    # Update positions
+    # ----------------------------
+    pos[mask_car] = car_center + new_rel_pos
+
+    # ----------------------------
+    # Update vitesses particules
+    # ----------------------------
+    vel[mask_car] = (
+        car_vel
+        + np.vstack([
+            -car_omega * new_rel_pos[:, 1],
+             car_omega * new_rel_pos[:, 0]
+        ]).T
+    )
+
+    return car_vel, car_omega
+
+
+def write_vtk(filename, pos, vel,v_mesh, pres, types, rho, vol, m, neighbors, shepard, wall_norms,
+              S_G_local, S_dist,grad_S_G, grad_S_dist, cond_array, renorm_status, grad_p, grad_vel, grad_rho, p_ref, cond_MLS):
+    n = len(pos)
+    S_G_to_write = np.broadcast_to(S_G_local, n)
+    S_dist_to_write = np.broadcast_to(S_dist, n)
+    with open(filename, 'w') as f:
+        f.write("# vtk DataFile Version 3.0\n")
+        f.write("SPH_RIEMANN_JET\n")
+        f.write("ASCII\n")
+        f.write("DATASET POLYDATA\n")
+
+        # Points
+        f.write(f"POINTS {n} float\n")
+        for p in pos:
+            f.write(f"{p[0]:.6f} {p[1]:.6f} 0.0\n")
+
+        # Vertices (obligatoire en POLYDATA)
+        f.write(f"\nVERTICES {n} {2*n}\n")
+        for i in range(n):
+            f.write(f"1 {i}\n")
+
+        # Données associées aux points
+        f.write(f"\nPOINT_DATA {n}\n")
+
+        f.write("SCALARS Pressure float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for p in pres:
+            f.write(f"{float(p):.6f}\n")
+
+        f.write("\nSCALARS Density float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for r in rho:
+            f.write(f"{float(r):.6f}\n")
+
+        f.write("\nSCALARS Volume float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for v in vol:
+            f.write(f"{float(v):.6f}\n")
+
+        f.write("\nSCALARS Type int 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for t in types:
+            f.write(f"{int(t)}\n")
+
+        f.write("\nVECTORS Velocity float\n")
+        for v in vel:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+            
+        f.write("\nVECTORS VelocityMeshSPH float\n")
+        for v in v_mesh:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+   
+        f.write("\nSCALARS Neighbors int 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for nb in neighbors:
+            f.write(f"{int(nb)}\n")
+
+        f.write("\nSCALARS Shepard float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for s in shepard:
+            f.write(f"{float(s):.6f}\n")
+        
+        f.write("\nSCALARS Masse float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for s in m:
+            f.write(f"{float(s):.6f}\n") 
+            
+        f.write("\nVECTORS WallNormals float\n")
+        for vn in wall_norms:
+            f.write(f"{vn[0]:.6f} {vn[1]:.6f} 0.0\n") 
+            
+       # --- UTILISATION DES TABLEAUX SÉCURISÉS ---
+        f.write("\nSCALARS S_G float 1\nLOOKUP_TABLE default\n")
+        for val in S_G_to_write:
+            f.write(f"{val:.6f}\n")
+            
+        f.write("\nSCALARS S_dist float 1\nLOOKUP_TABLE default\n")
+        for val in S_dist_to_write:
+            f.write(f"{val:.6f}\n")
+        # ------------------------------------------
+            
+        f.write("\nVECTORS grad_S_G float\n")
+        for v in grad_S_G:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+            
+        f.write("\nVECTORS grad_S_dist float\n")
+        for v in grad_S_dist:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+        # --- AJOUT DU NOMBRE DE CONDITIONNEMENT ---
+        f.write("\nSCALARS Cond_Number float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for c in cond_array:
+            f.write(f"{float(c):.6e}\n") # Utilisation du format scientifique car Cond peut être grand
+
+        # --- AJOUT DU STATUT (0=Id, 1=Reg, 2=Full) ---
+        f.write("\nSCALARS Renorm_Status int 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for s in renorm_status:
+            f.write(f"{int(s)}\n")
+
+        f.write("\nVECTORS gradP float\n")
+        for v in grad_p:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+        
+        f.write("\nVECTORS gradVElx float\n")
+        for v in grad_vel[:, 0, :]:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n") 
+        
+        f.write("\nVECTORS gradVEly float\n")
+        for v in grad_vel[:, 1, :]:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")  
+        
+        f.write("\nVECTORS gradRHO float\n")
+        for v in grad_rho:
+            f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n") 
+
+        # --- Remplacement de l'espace par un underscore ---
+        f.write("\nSCALARS refinement_MLS int 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for nb in p_ref:
+            f.write(f"{int(nb)}\n")
+        
+        f.write("\nSCALARS Cond_NumberMLS float 1\n")
+        f.write("LOOKUP_TABLE default\n")
+        for c in cond_MLS:
+            f.write(f"{float(c):.6e}\n")
+
+
+            
+def generate_funnel_wall(dx, n_layers):
+    pos_wall=[]
+    s=0.0
+    y=0.0
+    while y<=H_funnel:
+        r=get_funnel_radius(y)
+        drdy=get_funnel_derivative(y)
+        t=np.array([drdy,1.0])
+        t/=np.linalg.norm(t)
+        n=np.array([t[1],-t[0]])
+        for layer in range(n_layers):
+            offset=layer*dx
+            xw=r+n[0]*offset
+            yw=y+n[1]*offset
+            pos_wall.append([ xw, yw ])
+            pos_wall.append([ -xw, yw ])
+        # avance réelle sur la surface
+        ds=dx
+        dy=ds/np.sqrt(1+drdy**2)
+        y+=dy
+    return np.array(pos_wall)
+
+
+
+def compute_wall_normals(pos_wall):
+    normals = np.zeros_like(pos_wall)
+    for i,(x,y) in enumerate(pos_wall):
+        # projection radiale vers la surface
+        r_surface = get_funnel_radius(y)
+        # dérivée vraie locale
+        drdy = get_funnel_derivative(y)
+        t = np.array([drdy,1.0])
+        t /= np.linalg.norm(t)
+        n = np.array([t[1],-t[0]])
+        if x < 0:
+            n[0] *= -1
+        normals[i] = n
+    return -normals
+            
+def apply_density_filter(pos, m, rho, vol, types, h,tree):
+    """
+    Réinitialisation du champ de densité (Filtre de Shepard d'ordre 0)
+    pour stabiliser la pression et corriger la troncature en surface libre.
+    """
+       
+    n_p = len(pos)
+    new_rho = np.copy(rho)
+    
+    # On ne filtre que les particules fluides
+    mask_f = (types == 0) # FLUID
+    
+    for i in np.where(mask_f)[0]:
+        idx = tree.query_ball_point(pos[i], 2*h)
+        if len(idx) == 0: continue
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[idx])
+        else :
+            rij = pos[i]-pos[idx]
+        
+        r = np.linalg.norm(rij, axis=1)
+       
+        W = kernel_cubic(r, h)
+        
+        # Formule de Shepard pour la densité
+        num = np.sum(m[idx] * W)
+        den = np.sum((m[idx] / rho[idx]) * W)
+        
+        if den > 1e-12:
+            new_rho[i] = num / den
+
+    return new_rho
+
+
+            
+            
+
+def compute_fluid_fluid_interaction(i, j, pos, vel, v_mesh, rho, pres, vol, m, 
+                                    shepard_coeff, accel, drho, 
+                                    h, rho0, c0, mu, ViscoONOFF):
+    """
+    Calcule l'interaction entre deux particules de fluide (i, j) 
+    selon le formalisme SPH-ALE avec solveur de Riemann.
+    """
+    if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+    else :
+            rij = pos[i]-pos[j]# vector from j to i
+        
+    r = np.linalg.norm(rij)
+    
+    if r < 1e-12 or r > 2*h:
+        return
+
+    # 1. Géométrie de l'interface
+    grad_w, grad_w_mag = kernel_grad(rij, r, h)  #vector from i to j              
+    n_ij = rij / r
+    
+    
+    
+    # 2. Formalisme ALE : Vitesse de transport (Vitesse de l'interface)
+    # On utilise la vitesse vmesh (déplacement des particules) pour définir l'interface
+    v_interface = 0.5 * np.dot(v_mesh[i] + v_mesh[j], n_ij)
+    
+    # 3. Solveur de Riemann (États de surface)
+    # n_ij pointe de j vers i, donc j est l'état Gauche (L) et i l'état Droit (R)
+    uL   = np.dot(vel[j], n_ij) 
+    uR   = np.dot(vel[i], n_ij)
+    rhoL = rho[j]
+    rhoR = rho[i]
+    pL   = pres[j]
+    pR   = pres[i]
+    if mode_p_refinement == 1:
+        dist = np.linalg.norm(rij)
+        mid_dist = 0.5 * rij    
+        # 1. On calcule la pente "grossière" entre les deux particules
+        slope_p_ij   = (pres[i] - pres[j]) /dist  
+        slope_rho_ij = (rho[i]  - rho[j])  /dist
+
+        # 2. On récupère la projection des gradients MLS sur l'axe (i-j)
+        # Ces gradients ont été calculés par ta fonction compute_mls_gradients
+        g_pj   = np.dot(grad_p[j], n_ij)
+        g_pi   = np.dot(grad_p[i], n_ij)
+        
+        g_rhoj = np.dot(grad_rho[j], n_ij)
+        g_rhoi = np.dot(grad_rho[i], n_ij)
+
+        # 3. On LIMITE les pentes avec 
+        # On compare la pente au point avec la pente entre les deux points
+        limited_g_pj   = van_albada(g_pj, slope_p_ij)
+        limited_g_pi   = van_albada(g_pi, -slope_p_ij)
+        
+        limited_g_rhoj = van_albada(g_rhoj, slope_rho_ij)
+        limited_g_rhoi = van_albada(g_rhoi, -slope_rho_ij)
+        # 4. RECONSTRUCTION des états à l'interface (au milieu 0.5*dist)
+        # On part de j pour aller vers le milieu (sens -n_ij)
+        pL   = pres[j] + limited_g_pj   * 0.5 * dist   # ← était −
+        pR   = pres[i] - limited_g_pi   * 0.5 * dist   # ← était +
+        rhoL = rho[j]  + limited_g_rhoj * 0.5 * dist   # ← était −
+        rhoR = rho[i]  - limited_g_rhoi * 0.5 * dist   # ← était +
+        
+        # --- RECONSTRUCTION DE LA VITESSE (ORDRE 2 LIMITE) ---
+        
+        # 1. Pentes grossières pour chaque composante (x, y)
+        slope_vx_ij = (vel[i, 0] - vel[j, 0]) / dist   # ← était (vel[j,0]-vel[i,0])
+        slope_vy_ij = (vel[i, 1] - vel[j, 1]) / dist
+
+        # 2. Projections des gradients MLS de la vitesse sur l'axe ij
+        # Rappel : grad_vel[j] est de forme (2, 2) -> [[dvx/dx, dvx/dy], [dvy/dx, dvy/dy]]
+        g_vx_j = np.dot(grad_vel[j, 0, :], n_ij)
+        g_vx_i = np.dot(grad_vel[i, 0, :], n_ij)
+        g_vy_j = np.dot(grad_vel[j, 1, :], n_ij)
+        g_vy_i = np.dot(grad_vel[i, 1, :], n_ij)
+
+        # 3. Application du limiteur  sur les pentes de vitesse
+        limited_g_vx_j = van_albada(g_vx_j, slope_vx_ij)
+        limited_g_vx_i = van_albada(g_vx_i, -slope_vx_ij)
+        limited_g_vy_j = van_albada(g_vy_j, slope_vy_ij)
+        limited_g_vy_i = van_albada(g_vy_i, -slope_vy_ij)
+
+        # 4. Reconstruction des vecteurs vitesse aux interfaces
+        velL = np.array([
+        vel[j, 0] + limited_g_vx_j * 0.5 * dist,   # ← était −
+        vel[j, 1] + limited_g_vy_j * 0.5 * dist,
+        ])
+        velR = np.array([
+            vel[i, 0] - limited_g_vx_i * 0.5 * dist,   # ← était +
+            vel[i, 1] - limited_g_vy_i * 0.5 * dist,
+        ])
+
+        # 5. Projection finale pour le solveur de Riemann (scalaires uL, uR)
+        uL = np.dot(velL, n_ij)
+        uR = np.dot(velR, n_ij)
+        
+        #if(mesh_mode == 'lagrangian') : v_interface = 0.5 * (uL+uR)
+    
+    # Appel au solveur de Riemann (attention à bien passer j en premier, puis i)
+    u_star, p_star = riemann_solver(rhoL, uL, pL, rhoR, uR, pR, c0, P_b)
+    
+    # Vitesse relative (Vitesse matérielle Riemann - Vitesse de transport ALE)
+    u_relative = u_star - v_interface 
+    p_max = 2*rho0*c0**2
+    #p_star = np.clip(p_star,-0.5*B,p_max)
+    rho_star = get_density(p_star)        
+    #rho_star = 0.5*(rho[j]+rho[i])
+    # 4. Calcul du Vecteur Surface (A_vec) corrigé par Vila
+    if RenormON:
+        # Moyenne arithmétique des matrices de renormalisation
+        L_ij = 0.5 * (L_matrices[i] + L_matrices[j])
+        # On applique la matrice au gradient original
+        grad_w_corr = np.dot(L_ij, grad_w)
+        A_vec = vol[i] * vol[j] * grad_w_corr
+    elif ShepardCorr:
+        ci = max(shepard_coeff[i], 0.4)
+        cj = max(shepard_coeff[j], 0.4)
+        A_vec = (vol[i]/ci) * (vol[j]/cj) * grad_w
+    else:
+        A_vec = vol[i] * vol[j] * grad_w
+
+    A_mag = abs(np.dot(A_vec, n_ij))
+                             
+    # 5. Flux de Masse (Équation de continuité)
+    # mass_flux = rho * (u_matériel - v_transport) * Surface
+    mass_flux = rho_star * u_relative * A_mag           
+    
+    drho[i] += 2.0 * mass_flux / vol[i]
+    drho[j] -= 2.0 * mass_flux / vol[j]
+
+    # 6. Flux de Quantité de Mouvement (Équation de Momentum)
+    # F_mom = (Flux de masse * Vitesse de transport) + Force de pression
+    F_mom = (rho_star * u_star * u_relative + (p_star- P_b)) * A_mag * n_ij #from j to i
+    
+    accel[i] += 2.0 * F_mom / m[i]  
+    accel[j] -= 2.0 * F_mom / m[j]          
+
+    # 7. Viscosité Physique (Morris et al.)
+    # ----------------------------------------------------------------
+    # Viscosité Morris et al. (1997) — CORRECT
+    # f_ij = x_ij · ∇_i W_ij / (r² + η²)  doit être < 0
+    # x_ij = pos[i]-pos[j] = rij  ;  ∇_i W = grad_w
+    # dot(rij, grad_w) = (dW/dr)·r < 0  ✓
+    # ----------------------------------------------------------------
+    if ViscoONOFF:
+        vij = vel[i] - vel[j]  # v_ij = v_i - v_j
+        # --- CORRECTION DE CONSISTANCE ---
+        # On utilise le même gradient que celui qui a servi à calculer A_vec
+        # Si RenormON, on utilise grad_w_corr, sinon grad_w
+        if RenormON:
+            # On récupère le gradient renormalisé calculé plus haut
+            target_grad_w = grad_w_corr 
+        elif ShepardCorr:
+            # Si Shepard, le gradient effectif est multiplié par les facteurs 1/C
+            ci = max(shepard_coeff[i], 0.4)
+            cj = max(shepard_coeff[j], 0.4)
+            target_grad_w = grad_w / (ci * cj)
+        else:
+            target_grad_w = grad_w
+
+        # Le produit scalaire doit utiliser le gradient "vu" par les autres flux
+        rij_dot_gradW = np.dot(rij, target_grad_w)
+
+        # η² évite la singularité (0.01 * h²)
+        dist_sq_eps = r**2 + 0.01 * h**2
+
+        # Terme de Morris : (mu_i + mu_j) / (rho_i * rho_j)
+        # Note : mu ici est la viscosité dynamique (Pa.s)
+        visco_term = (2.0* mu) / (rho[i] * rho[j])
+
+        # Calcul de l'accélération spécifique (force par unité de masse)
+        # On multiplie par m[j] pour l'accélération de i
+        f_visc_base = visco_term * (rij_dot_gradW / dist_sq_eps) * vij
+
+        accel[i] += m[j] * f_visc_base
+        accel[j] -= m[i] * f_visc_base  # antisymétrie
+
+def compute_fluid_wall_interaction(i, j, pos, vel, types, rho, pres, vol, m, 
+                                   shepard_coeff, wall_normals_full, accel, drho,
+                                   h, mu, gamma, ViscoONOFF, FLUID):
+    """
+    Calcule l'interaction entre une particule de fluide et une particule de mur
+    en utilisant un solveur de Riemann (Miroir No-Slip) et le formalisme SPH-ALE.
+    """  
+    # 1. Identification Fluide / Mur
+    idx_f, idx_w = (i, j) if types[i] == FLUID else (j, i)   
+    rij = pos[idx_w] - pos[idx_f]
+    r = np.linalg.norm(rij) 
+    if r < 1e-12 or r > 2*h:
+        return
+    # 2. Géométrie et Normale du mur
+    n_fw = wall_normals_full[idx_w] #from w to f
+    # Sécurité orientation : la normale doit pointer vers le fluide
+    if np.dot(n_fw, pos[idx_f] - pos[idx_w]) < 0:
+        n_fw = -n_fw       
+    grad_w, grad_w_mag_fw = kernel_grad(rij, r, h)   
+    # 0. Correction de surface (Shepard)
+    # On utilise le coefficient de la particule fluide pour compenser la troncature
+    # Vecteur surface efficace
+    # 0. Correction de surface
+    if RenormON:
+        L_fw = 0.5 * (L_matrices[idx_f] + L_matrices[idx_w])
+        grad_w_corr = np.dot(L_fw, grad_w)
+        A_vec = vol[idx_f] * vol[idx_w] * grad_w_corr
+    elif ShepardCorr:
+        cf = max(shepard_coeff[idx_f], 0.4)
+        cw = max(shepard_coeff[idx_w], 0.4)
+        A_vec = (vol[idx_f]/cf) * (vol[idx_w]/cw) * grad_w
+    else:
+        A_vec = vol[idx_f] * vol[idx_w] * grad_w
+
+    A_mag = abs(np.dot(A_vec, n_fw))  
+                
+                
+                
+    # 1. États de Riemann (Miroir No-Slip)   
+    u_wall_n = np.dot(vel[idx_w], n_fw)
+    uR = np.dot(vel[idx_f], n_fw)         # Right = Fluide
+    uL = 2*u_wall_n - uR                  # Left = Mur (Miroir)    
+    
+    rhoR = rho[idx_f]
+    rhoL = rho[idx_w]
+    pR   = pres[idx_f]
+    pL   = pres[idx_w]
+    
+    
+    if mode_p_refinement == 1:
+        # Distance et vecteur normal unitaire de l'interface (du mur vers le fluide)
+        dist = r 
+        # n_fw est déjà calculée et pointe du mur vers le fluide
+        
+        # 1. Calcul des pentes "grossières" (Finite Difference entre fluide et mur)
+        # Note : On considère le mur (idx_w) comme l'état Gauche (L) 
+        # et le fluide (idx_f) comme l'état Droit (R)
+        slope_p_fw   = (pres[idx_f] - pres[idx_w]) / dist
+        slope_rho_fw = (rho[idx_f] - rho[idx_w]) / dist
+
+        # 2. Récupération des gradients (Attention : souvent nuls pour les murs, 
+        # on se repose alors sur le limiteur vers la pente grossière)
+        g_pf   = np.dot(grad_p[idx_f], n_fw)
+        g_pw   = np.dot(grad_p[idx_w], n_fw)
+        g_rhof = np.dot(grad_rho[idx_f], n_fw)
+        g_rhow = np.dot(grad_rho[idx_w], n_fw)
+
+        # 3. Limiteur  (stabilise la reconstruction à l'ordre 2)
+        # On reconstruit l'état au milieu de la distance (0.5 * dist)
+        limited_g_pf   = van_albada(g_pf, slope_p_fw)
+        limited_g_pw   = van_albada(g_pw, slope_p_fw)
+        limited_g_rhof = van_albada(g_rhof, slope_rho_fw)
+        limited_g_rhow = van_albada(g_rhow, slope_rho_fw)
+
+        # 4. RECONSTRUCTION à l'interface
+        # État Mur (L) : on avance de 0.5*dist vers le fluide
+        pL   = pres[idx_w] + limited_g_pw * (0.5 * dist)
+        rhoL = rho[idx_w] + limited_g_rhow * (0.5 * dist)
+        
+        # État Fluide (R) : on recule de 0.5*dist vers le mur
+        pR   = pres[idx_f] - limited_g_pf * (0.5 * dist)
+        rhoR = rho[idx_f] - limited_g_rhof * (0.5 * dist)
+        
+        # --- RECONSTRUCTION DE LA VITESSE (Condition No-Slip Miroir) ---
+        
+        # Pour le fluide (R)
+        slope_vx_fw = (vel[idx_f, 0] - vel[idx_w, 0]) / dist
+        slope_vy_fw = (vel[idx_f, 1] - vel[idx_w, 1]) / dist
+        
+        g_vx_f = np.dot(grad_vel[idx_f, 0, :], n_fw)
+        g_vy_f = np.dot(grad_vel[idx_f, 1, :], n_fw)
+        
+        # On limite le gradient du fluide
+        lim_g_vx_f = van_albada(g_vx_f, slope_vx_fw)
+        lim_g_vy_f = van_albada(g_vy_f, slope_vy_fw)
+        
+        # Vitesse reconstruite côté fluide (R)
+        velR = np.zeros(2)
+        velR[0] = vel[idx_f, 0] - lim_g_vx_f * (0.5 * dist)
+        velR[1] = vel[idx_f, 1] - lim_g_vy_f * (0.5 * dist)
+        uR = np.dot(velR, n_fw)
+
+        # État Mur (L) : Application de la condition Miroir No-Slip sur l'état reconstruit
+        # uL = 2*u_wall_normale - uR
+        u_wall_n = np.dot(vel[idx_w], n_fw)
+        uL = 2 * u_wall_n - uR
+    
+    
+    
+    
+    # 2.Appel au solveur de Riemann (attention à bien passer j en premier, puis i)
+    u_star, p_star = riemann_solver(rhoL, uL, pL, rhoR, uR, pR, c0, P_b)
+    #rho_star = 0.5 * (rhoL + rhoR)
+    rho_star = get_density(p_star)
+    v_interface = 0.5 * (uR + u_wall_n)
+    
+    u_rel_w = u_star - v_interface 
+    
+    # 3. Flux de Quantité de Mouvement
+    # Momentum = (Pression + Terme advectif ALE) * Surface
+    # Note: u_star * u_rel_w est nul pour un mur fixe, seul p_star reste.
+    momentum_flux_w = ((p_star- P_b) + rho_star * u_star * u_rel_w) * A_mag * n_fw
+    # 6. Application des Accélérations    
+    accel[idx_f] += 2.0 * momentum_flux_w / m[idx_f] 
+    # Flux de masse à la paroi (Continuité)
+    # rho_star * (u_star - u_wall_n) est la vitesse relative nette à travers l'interface
+    mass_flux_w =  rho_star * (u_rel_w) * A_mag
+    # Mise à jour de la variation de densité
+    drho[idx_f] += 2.0 * mass_flux_w / vol[idx_f]
+    
+    
+    # 7. Viscosité au mur (Condition No-Slip physique)
+    # ----------------------------------------------------------------
+    # Viscosité Morris — paroi  CORRECTION DU SIGNE
+    #
+    # Morris : f_fw = x_fw · ∇_f W_fw / (r² + η²)
+    #   x_fw  = pos[f] - pos[w] = -rij
+    #   ∇_f W = (dW/dr/r)·(pos[f]-pos[w]) = -grad_w
+    #   ⟹ x_fw · ∇_f W = (−rij)·(−grad_w) = dot(rij, grad_w) = (dW/dr)·r < 0  ✓
+    #
+    if ViscoONOFF:
+        # Rappel : idx_f = fluide, idx_w = mur
+        vfw = vel[idx_f] - vel[idx_w]
+        rij_dot_gradW = np.dot(rij, grad_w)
+
+        dist_sq_eps = r**2 + 0.01 * h**2
+
+        # Terme de Morris
+        # On utilise souvent la viscosité du fluide pour le mur
+        visco_term = ( 2.0*mu) / (rho[idx_f] * rho[idx_w])
+
+        # Accélération du fluide due au mur
+        # Facteur 2.0 souvent ajouté en SPH pour les parois pour compenser la troncature
+        # (Colagrossi & Landrini 2003) — choix de modélisation documenté
+        f_visc_wall = 2.0*  visco_term * (rij_dot_gradW  / dist_sq_eps) * vfw
+
+        accel[idx_f] += m[idx_w] *f_visc_wall       
+        
+        
+    if (testCase == 'car' and types[idx_w] == CAR) or (testCase == 'bodyF' and types[idx_w] == BODY):
+        accel[idx_w] -= 2.0 * momentum_flux_w / m[idx_w]  
+    if ViscoONOFF and (testCase == 'car' and types[idx_w] == CAR):
+        accel[idx_w] += m[idx_f] * f_visc_wall     
+        
+def compute_shepard_coefficients(pairs, pos, vol, h,
+                                 shepard_coeff,
+                                 num_neighbors,
+                                 kernel_cubic):
+    """
+    Calcule les coefficients de normalisation de Shepard
+    et le nombre de voisins SPH.
+    """
+
+    h2 = 2.0 * h
+
+    for i, j in pairs:
+        if Periodic:
+            rij = periodic_rij(pos[i], pos[j])
+        else :
+            rij = pos[i]-pos[j]# vector from j to i
+        
+        r = np.linalg.norm(rij)
+        
+        # Skip interactions hors support
+        if r < 1e-12 or r > h2:
+            continue
+
+        Wij = kernel_cubic(r, h)
+
+        # --- contribution symétrique ---
+        if types[i] == FLUID :
+            shepard_coeff[i] += Wij * vol[j]
+            
+        if types[j] == FLUID:            
+            shepard_coeff[j] += Wij * vol[i]
+
+        num_neighbors[i] += 1
+        num_neighbors[j] += 1
+        
+def compute_pressure_wall(pairs, pos, vol, h, kernel_cubic, pres, types, g, rho0):
+    h2 = 2.0 * h
+    pres_fluid = pres.copy()
+    
+    shepard_fluid_wall = np.zeros(len(pos))   # Σ W*V fluide vu du mur
+   
+    
+    for i, j in pairs:
+        rij = pos[i] - pos[j] if not Periodic else periodic_rij(pos[i], pos[j])
+        r = np.linalg.norm(rij)
+        if r < 1e-12 or r > h2:
+            continue
+        Wij = kernel_cubic(r, h)
+
+        solid_types = [WALL]
+
+        if 'CAR' in globals():
+            solid_types.append(CAR)
+        if 'BODY' in globals():
+            solid_types.append(BODY)
+            solid_types.append(FLAP)
+
+        mask_wall = np.isin(types, solid_types)
+        if mask_wall[i] and types[j] == FLUID :
+            # Correction hydrostatique : ramener la pression au niveau de la paroi
+            #dy = pos[j, 1] - pos[i, 1]          # positif si fluide au-dessus
+            p_extrap = pres_fluid[j] #+ rho0 * g[1] * (-dy)  # g[1] = -g_acc
+            pres[i] += Wij * vol[j] * p_extrap
+            shepard_fluid_wall[i] += Wij * vol[j]
+            
+        elif mask_wall[j] and types[i] == FLUID :
+            dy = pos[i, 1] - pos[j, 1]
+            p_extrap = pres_fluid[i] #+ rho0 * g[1] * (-dy)
+            pres[j] += Wij * vol[i] * p_extrap
+            shepard_fluid_wall[j] += Wij * vol[i]
+    
+    solid_types = [WALL]
+
+    if 'CAR' in globals():
+        solid_types.append(CAR)
+    if 'BODY' in globals():
+        solid_types.append(BODY)
+        solid_types.append(FLAP)
+
+    mask_wall = np.isin(types, solid_types)
+    
+    pres[mask_wall] /= (shepard_fluid_wall[mask_wall] + 1e-12)
+
+        
+
+def compute_derivatives(        
+        pos, vel, rho, pres,
+        vol, m,
+        accel, drho,
+        types,
+        h, dt,
+        shepard_coeff,
+        wall_normals,
+        v_mesh, tree,pairs,L_matrices ):
+    #Compute interactions (except for mesh analysis : testCase TGVmesh)
+    if testCase != 'TGVmesh':
+        for i, j in pairs:
+            if types[i] == FLUID and types[j] == FLUID:
+
+                compute_fluid_fluid_interaction(
+                        i, j,
+                        pos, vel, v_mesh,
+                        rho, pres, vol, m,
+                        shepard_coeff,
+                        accel, drho,
+                        h, rho0, c0, mu, ViscoONOFF
+                    )
+
+            elif (types[i] == FLUID and types[j] == WALL) or \
+                     (types[i] == WALL and types[j] == FLUID):
+
+                compute_fluid_wall_interaction(
+                        i, j,
+                        pos, vel, types,
+                        rho, pres, vol, m,
+                        shepard_coeff,
+                        wall_normals,
+                        accel,drho,
+                        h, mu, gamma, ViscoONOFF,
+                        FLUID
+                    )
+            if testCase =='bodyF':
+                if (types[i] == FLUID and types[j] == FLAP) or \
+                    (types[j] == FLUID and types[i] == FLAP) or \
+                    (types[i] == FLUID and types[j] == BODY) or \
+                    (types[j] == FLUID and types[i] == BODY): 
+                    compute_fluid_wall_interaction(
+                            i, j,
+                            pos, vel, types,
+                            rho, pres, vol, m,
+                            shepard_coeff,
+                            wall_normals,
+                            accel,drho,
+                            h, mu, gamma, ViscoONOFF,
+                            FLUID
+                            )
+                        
+                        
+                    
+            elif testCase == 'car':
+                if (types[i] == FLUID and types[j] == CAR) or (types[j] == FLUID and types[i] == CAR):
+                    compute_fluid_wall_interaction(
+                        i, j,
+                        pos, vel, types,
+                        rho, pres, vol, m,
+                        shepard_coeff,
+                        wall_normals,
+                        accel, drho,
+                        h, mu, gamma, ViscoONOFF,
+                        FLUID
+                    )
+                elif (types[i] == CAR and types[j] == WALL) or (types[j] == CAR and types[i] == WALL):
+                    idx_c, idx_w = (i, j) if types[i] == CAR else (j, i)
+                    apply_spring_collision(idx_c, idx_w, pos, vel, accel, types, m, R_car, R_wall) 
+
+        #---------------------------------------------------------------------------------------------------------------------         
+    if testCase =='bodyF':
+            # ------------------------------------------------------------------
+            # 8h. Intégration temporelle du corps flottant (3 DDL)
+            # ------------------------------------------------------------------
+        accel_body_only = accel[idx_body_start:idx_body_start + n_body].copy()
+
+        body_vel, body_omega, body_theta, body_cm = update_floating_body_rk2(
+                pos, vel, accel_body_only, m, types,
+                body_vel, body_omega, body_theta, body_cm,
+                rel_pos0, nrm_body0_global, mass_body_2D, I_body_2D, g,
+                wall_normals, idx_body_start, n_body, dt
+            )            
+            
+            
+    if testCase == 'car': 
+            # 3. Mise à jour du Corps Rigide (La Voiture)
+        mask_car = (types == CAR)
+            # Somme des forces sur la voiture
+        total_force_car = np.sum(m[mask_car, None] * (accel[mask_car] + g), axis=0)
+        car_center = np.mean(pos[mask_car], axis=0)
+            # Somme des moments
+        rel_pos = pos[mask_car] - car_center
+        forces_indiv = m[mask_car, None] * (accel[mask_car] + g)
+        total_torque_car = np.sum(rel_pos[:,0] * forces_indiv[:,1] - rel_pos[:,1] * forces_indiv[:,0])
+
+            # Accélérations rigides
+        acc_rigid = total_force_car / car_mass
+        alpha_rigid = total_torque_car / car_I
+            # Voiture (Mouvement rigide)
+        car_vel += acc_rigid * dt
+        car_omega += alpha_rigid * dt
+
+            # Mise à jour positions et vitesses des particules de la voiture
+        car_center += car_vel * dt
+        d_theta = car_omega * dt
+        rot_mat = np.array([[np.cos(d_theta), -np.sin(d_theta)], [np.sin(d_theta), np.cos(d_theta)]])
+
+        new_rel_pos = np.dot(rel_pos, rot_mat.T)
+        pos[mask_car] = car_center + new_rel_pos
+        vel[mask_car] = car_vel + np.vstack([-car_omega * new_rel_pos[:,1], car_omega * new_rel_pos[:,0]]).T
+    
+
+    # -------------------- chantier ----------------------------------------
+    return drho, accel
+        
+        
+def update_jet_buffers(
+        testCase,
+        pos, vel, types,
+        rho, pres, vol, m,
+        num_neighbors, shepard_coeff,
+        bx, dx,
+        y_inlet_top, y_inlet_bottom,
+        v_jet, rho0,
+        BUFFER_TOP, BUFFER_BOTTOM, FLUID,
+        DOUBLE_JET=True,
+        randompos=False,
+        add_position_noise=None
+    ):
+    """
+    Gestion des buffers d'injection pour le test 'jet'.
+    - conversion buffer -> fluide
+    - régénération automatique des couches buffer
+    """
+
+    if testCase != 'jet':
+        return pos, vel, types, rho, pres, vol, m, num_neighbors, shepard_coeff
+
+    # =====================================================
+    # 1. Conversion buffer -> fluide
+    # =====================================================
+    mask_top = (types == BUFFER_TOP)
+    mask_bot = (types == BUFFER_BOTTOM)
+
+    to_fluid_top = mask_top & (pos[:, 1] < y_inlet_top)
+    to_fluid_bot = mask_bot & (pos[:, 1] > y_inlet_bottom)
+
+    types[to_fluid_top | to_fluid_bot] = FLUID
+
+    # =====================================================
+    # 2. Régénération buffers
+    # =====================================================
+    to_add_pos = []
+    to_add_vel = []
+    to_add_types = []
+
+    tol = 1e-7
+
+    # ---------- TOP JET ----------
+    if np.any(types == BUFFER_TOP):
+
+        y_max_top = np.max(pos[types == BUFFER_TOP, 1])
+
+        if y_max_top < (y_inlet_top + 3 * dx + tol):
+
+            y_new = y_max_top + dx
+            new_layer = np.vstack([bx, np.full_like(bx, y_new)]).T
+
+            if randompos and add_position_noise is not None:
+                new_layer = add_position_noise(new_layer, 0.15 * dx)
+
+            to_add_pos.append(new_layer)
+            to_add_vel.append(np.tile([0, -v_jet], (len(bx), 1)))
+            to_add_types.append(np.full(len(bx), BUFFER_TOP))
+
+    # ---------- BOTTOM JET ----------
+    if DOUBLE_JET and np.any(types == BUFFER_BOTTOM):
+
+        y_min_bot = np.min(pos[types == BUFFER_BOTTOM, 1])
+
+        if y_min_bot > (y_inlet_bottom - 3 * dx - tol):
+
+            y_new = y_min_bot - dx
+            new_layer = np.vstack([bx, np.full_like(bx, y_new)]).T
+
+            if randompos and add_position_noise is not None:
+                new_layer = add_position_noise(new_layer, 0.15 * dx)
+
+            to_add_pos.append(new_layer)
+            to_add_vel.append(np.tile([0, v_jet], (len(bx), 1)))
+            to_add_types.append(np.full(len(bx), BUFFER_BOTTOM))
+
+    # =====================================================
+    # 3. Ajout des nouvelles particules
+    # =====================================================
+    if to_add_pos:
+
+        new_p = np.vstack(to_add_pos)
+        new_v = np.vstack(to_add_vel)
+        new_t = np.concatenate(to_add_types)
+
+        n_add = len(new_p)
+
+        pos = np.vstack([pos, new_p])
+        vel = np.vstack([vel, new_v])
+        types = np.concatenate([types, new_t])
+
+        rho = np.concatenate([rho, np.full(n_add, rho0)])
+        pres = np.concatenate([pres, np.zeros(n_add)])
+        vol = np.concatenate([vol, np.full(n_add, dx**2)])
+        m = np.concatenate([m, np.full(n_add, rho0 * dx**2)])
+
+        num_neighbors = np.concatenate(
+            [num_neighbors, np.zeros(n_add, dtype=int)]
+        )
+
+        shepard_coeff = np.concatenate(
+            [shepard_coeff, np.zeros(n_add)]
+        )
+
+    return (
+        pos, vel, types,
+        rho, pres, vol, m,
+        num_neighbors, shepard_coeff
+    )   
+
+def apply_spring_collision(idx_c, idx_w, pos, vel, accel, types, m, R_car, R_wall):
+    """
+    Calcule et applique une force de réaction élastique (mass-spring-damper)
+    entre une voiture et un élément de mur.
+    """
+    # 1. Calcul du vecteur distance et de la norme
+    rij = pos[idx_c] - pos[idx_w]
+    r = np.linalg.norm(rij)
+
+    # Sécurité pour éviter la division par zéro si les centres sont confondus
+    if r < 1e-12:
+        return
+
+    # 2. Vérification de l'interpénétration
+    # On calcule la distance de pénétration
+    penetration = (R_car + R_wall) - r
+
+    if penetration > 0:
+        # Vecteur normal unitaire (du mur vers la voiture)
+        nij = rij / r
+        
+        # 3. Calcul de la vitesse relative normale
+        vrel = vel[idx_c] - vel[idx_w]
+        vn = np.dot(vrel, nij)        
+        
+        # 5. Calcul de la force (Loi de Hooke + Amortissement)
+        # Note : On n'applique l'amortissement que si les objets se rapprochent (vn < 0)
+        # pour éviter que la voiture ne reste "collée" au mur en sortant.
+        f_spring = k * penetration
+        f_damper = -damping * vn if vn < 0 else 0        
+        force = (f_spring + f_damper) * nij        
+        # 6. Mise à jour de l'accélération (F = ma => a = F/m)
+        accel[idx_c] += force / m[idx_c]
+
+
+
+
+#--------------------------------------------------------------------------------------------------------------------- 
+# Initialisation
+#---------------------------------------------------------------------------------------------------------------------
+if testCase == 'bodyF':
+    # ==============================================================================
+    # 2.  GÉNÉRATEUR DE HOULE — CLAPET ARTICULÉ (FLAP WAVEMAKER)
+    # ==============================================================================
+    #
+    #  Le clapet tourne autour de son axe inférieur (0, 0).
+    #  Son mouvement est un paquet de N_waves composantes spectrales focalisées
+    #  au point (x_focus, t_focus), simulant l'expérience de Hadzic et al. (2005).
+    #
+    #  Si le fichier Flap.dat (fourni par SPHERIC) est disponible, il est chargé
+    #  directement via load_flap_dat(). Sinon, la génération analytique est utilisée.
+
+    N_waves   = 20
+    omega_min = 1.0       # [rad/s]  (T_max ≈ 6.3 s)
+    omega_max = 4.0       # [rad/s]  (T_min ≈ 1.6 s)
+    t_focus   = 32.0      # instant de focalisation [s]
+    x_focus   = x_body_init   # position de focalisation = centre du corps
+    H_focus   = H_body    # hauteur de vague au focus = hauteur du corps = 0.05 m
+
+    omega_n   = np.linspace(omega_min, omega_max, N_waves)
+
+    def solve_dispersion(omega, H, tol=1e-10, max_iter=100):
+        """Résout ω² = g k tanh(kH) par Newton-Raphson."""
+        k = omega**2 / g_acc   # estimation eau profonde
+        for _ in range(max_iter):
+            f  =  g_acc * k * np.tanh(k * H) - omega**2
+            df =  g_acc * (np.tanh(k * H) + k * H / np.cosh(k * H)**2)
+            dk = -f / (df + 1e-20)
+            k += dk
+            if abs(f) < tol:
+                break
+        return max(k, 1e-8)
+
+    k_n = np.array([solve_dispersion(w, H_water) for w in omega_n])
+    T_n = 2.0 * np.pi / omega_n     # périodes
+    L_n = 2.0 * np.pi / k_n         # longueurs d'onde
+
+    def flap_transfer_function(k, H):
+        """
+        Fonction de transfert du clapet articulé au fond.
+        Donne le rapport amplitude_surface / (stroke_clapet / 2).
+        Source : Dean & Dalrymple (1991), Eq. 7.5
+        """
+        kH = k * H
+        num = 4.0 * np.sinh(kH)**2
+        den = 2.0 * kH + np.sinh(2.0 * kH)
+        return np.sqrt(num / den + 1e-20)
+
+    Kf_n = flap_transfer_function(k_n, H_water)
+
+    # Amplitude de chaque composante spectrale (spectre plat)
+    a_n = np.full(N_waves, H_focus / (2.0 * N_waves))
+
+    # Phase : focalisation constructive en (x_focus, t_focus)
+    phi_n = k_n * x_focus - omega_n * t_focus
+
+    # Amplitude angulaire du clapet pour chaque composante [rad]
+    # a = Kf * (amplitude_stroke) => amplitude_stroke = a / Kf
+    # Pour le clapet : stroke = θ_max * H_water / 2 => θ_max = 2*stroke / H_water
+    theta_amp_n = 2.0 * (a_n / Kf_n) / H_water
+
+    print(f"\nParquet de vagues : {N_waves} composantes, f ∈ [{omega_min/(2*np.pi):.2f}, {omega_max/(2*np.pi):.2f}] Hz")
+    print(f"Focalisation : x={x_focus:.2f}m, t={t_focus:.1f}s, H_focus={H_focus*100:.1f}cm")
+    print(f"Amplitude angulaire max du clapet : {np.max(theta_amp_n)*180/np.pi:.2f}°")
+
+    def flap_angle(t, ramp_dur=5.0):
+        """Angle du clapet θ(t) [rad] avec rampe initiale pour démarrage doux."""
+        ramp = min(t / ramp_dur, 1.0)
+        return ramp * float(np.sum(theta_amp_n * np.sin(omega_n * t + phi_n)))
+
+    def flap_angular_velocity(t, ramp_dur=5.0):
+        if t < ramp_dur:
+            ramp  = t / ramp_dur
+            ramp_prime = 1.0 / ramp_dur
+        else:
+            ramp, ramp_prime = 1.0, 0.0
+        f      = float(np.sum(theta_amp_n * np.sin(omega_n * t + phi_n)))
+        f_prime = float(np.sum(theta_amp_n * omega_n * np.cos(omega_n * t + phi_n)))
+        return ramp_prime * f + ramp * f_prime
+
+    def load_flap_dat(filepath):
+        """
+        Charge le fichier Flap.dat officiel SPHERIC (téléchargeable sur spheric-sph.org).
+        Colonnes : Temps [s], Angle [degrés]
+        Gère automatiquement les lignes d'en-tête (Time, #, %, lettres...).
+        Retourne des fonctions interpolées θ(t) et θ̇(t).
+        """
+        # --- Détection automatique du nombre de lignes d'en-tête ---
+        skiprows = 0
+        with open(filepath, 'r') as fh:
+            for line in fh:
+                stripped = line.strip()
+                # Ligne vide ou commençant par un caractère non numérique/signe
+                if not stripped:
+                    skiprows += 1
+                    continue
+                first_char = stripped[0]
+                if first_char in ('#', '%', '!', '"', "'") or first_char.isalpha():
+                    skiprows += 1
+                else:
+                    break   # première ligne numérique trouvée
+
+        data   = np.loadtxt(filepath, skiprows=skiprows)
+        t_dat  = data[:, 0]
+        th_raw = data[:, 1]
+
+        
+        th_rad = np.deg2rad(th_raw)
+        th_rad = th_rad - th_rad[0] # Sécurité pour partir de 0.0
+        unit   = "degrés → radians"
+        
+
+        thdot = np.gradient(th_rad, t_dat)
+
+        f_theta    = interp1d(t_dat, th_rad, kind='cubic',
+                              fill_value=(th_rad[0], th_rad[-1]), bounds_error=False)
+        f_thetadot = interp1d(t_dat, thdot,  kind='cubic',
+                              fill_value=0.0, bounds_error=False)
+
+        print(f"[OK] Flap.dat chargé : {len(t_dat)} points, "
+              f"t ∈ [{t_dat[0]:.2f}, {t_dat[-1]:.2f}]s, "
+              f"angle {unit}, "
+              f"|θ|_max = {np.max(np.abs(th_rad))*180/np.pi:.2f}°, "
+              f"lignes en-tête sautées : {skiprows}")
+        return f_theta, f_thetadot
+
+    # Utilisation de Flap.dat si disponible
+    _flap_dat_path = os.path.join('.', 'Flap.dat')
+    if os.path.exists(_flap_dat_path):
+        _f_theta, _f_thetadot = load_flap_dat(_flap_dat_path)
+        flap_angle            = lambda t, **kw: float(_f_theta(t))
+        flap_angular_velocity = lambda t, **kw: float(_f_thetadot(t))
+        print("[INFO] Utilisation de Flap.dat (données SPHERIC officielles)")
+    else:
+        print("[INFO] Flap.dat non trouvé → paquet de vagues analytique")
+
+    # ==============================================================================
+    # 3.  FONCTIONS DU CORPS FLOTTANT (RIGID BODY — 3 DDL)
+    # ==============================================================================
+
+    def build_floating_body(x_cm, y_cm, L, H, dx_body):
+        """
+        Crée une grille régulière de particules pour le corps flottant.
+        Retourne : positions, normales de surface, positions relatives au CM.
+        """
+        nx = max(2, int(L / dx_body))
+        ny = max(2, int(H / dx_body))
+        dx_eff = L / nx
+        dy_eff = H / ny
+
+        xs = np.arange(dx_eff/2, L, dx_eff) - L/2
+        ys = np.arange(dy_eff/2, H, dy_eff) - H/2
+        Xb, Yb = np.meshgrid(xs, ys)
+        rel_pos0 = np.column_stack([Xb.ravel(), Yb.ravel()])  # relative au CM
+        pos_b    = rel_pos0 + np.array([x_cm, y_cm])
+
+        # Calcul des normales (détection des particules de surface)
+        n_parts = len(pos_b)
+        normals = np.zeros((n_parts, 2))
+        pts_set = set(map(lambda p: (round(p[0], 8), round(p[1], 8)), rel_pos0))
+
+        for idx in range(n_parts):
+            p   = rel_pos0[idx]
+            nrm = np.zeros(2)
+            for d in np.array([[dx_eff,0],[-dx_eff,0],[0,dy_eff],[0,-dy_eff]]):
+                nb  = (round(p[0]+d[0], 8), round(p[1]+d[1], 8))
+                if nb not in pts_set:
+                    nrm += d
+            if np.linalg.norm(nrm) > 1e-12:
+                # Vérifier que la normale pointe vers l'extérieur
+                if np.dot(nrm, p) < 0:
+                    nrm = -nrm
+                normals[idx] = nrm / np.linalg.norm(nrm)
+
+        print(f"Corps flottant : {n_parts} particules ({nx} × {ny})")
+        return pos_b, normals, rel_pos0
+
+    def update_floating_body_rk2(pos, vel, accel_body, m, types,
+                                   body_vel, body_omega, body_theta, body_cm,
+                                   rel_pos0, normals0, mass_2D, I_2D, g,
+                                   wall_normals, idx_body_start, n_body, dt,
+                                   step='full'):
+        """
+        Intègre le mouvement du corps rigide (sway, heave, roll).
+
+        Équations du mouvement :
+          m × ẍ_cm = ΣF_fluid_x
+          m × ÿ_cm = ΣF_fluid_y + m × g_y        (gravité sur le corps)
+          I × θ̈   = Σ(r × F_fluid)              (moment par rapport au CM)
+
+        La pression de flottaison et les forces de rappel ne sont PAS ajoutées
+        explicitement : elles découlent naturellement de la pression SPH.
+
+        Paramètres
+        ----------
+        step : 'full' (Euler), 'predictor' ou 'corrector' (RK2 externe)
+        """
+        mask_body = (types == BODY)
+
+        # --- Forces SPH exercées sur le corps ---
+        # accel[mask_body] contient les accélérations dues au fluide
+        F_sph = np.sum(m[mask_body, None] * accel_body, axis=0)   # [N/m]
+
+        # Gravité
+        F_gravity = np.array([0.0, -mass_2D * g_acc])             # [N/m]
+
+        F_total = F_sph + F_gravity
+
+        # --- Moment angulaire par rapport au CM courant ---
+        rel_cur = pos[mask_body] - body_cm         # positions relatives actuelles
+        f_indiv = m[mask_body, None] * accel_body  # forces individuelles SPH
+        # Produit vectoriel 2D : M = r_x * F_y - r_y * F_x
+        torque = np.sum(rel_cur[:, 0] * f_indiv[:, 1] - rel_cur[:, 1] * f_indiv[:, 0])
+
+        # --- Accélérations linéaire et angulaire ---
+        a_lin   = F_total / mass_2D                # [m/s²]
+        alpha   = torque   / I_2D                  # [rad/s²]
+
+        # --- Intégration temporelle ---
+        new_vel   = body_vel   + a_lin  * dt
+        new_omega = body_omega + alpha  * dt
+        new_theta = body_theta + new_omega * dt
+        new_cm    = body_cm    + new_vel   * dt
+
+        # --- Mise à jour des positions et vitesses des particules du corps ---
+        ct, st = np.cos(new_theta), np.sin(new_theta)
+        R = np.array([[ct, -st], [st, ct]])
+
+        # Positions : pos_i = CM_new + R(θ_new) @ rel_pos0_i
+        new_rel = rel_pos0 @ R.T                         # (n_body, 2)
+        pos[mask_body]    = new_cm + new_rel
+
+        # Vitesses : v_i = v_CM + ω × r_rel_i
+        vel[mask_body, 0] = new_vel[0] - new_omega * new_rel[:, 1]
+        vel[mask_body, 1] = new_vel[1] + new_omega * new_rel[:, 0]
+
+        # Normales : rotation des normales initiales
+        new_norms = normals0 @ R.T
+        wall_normals[idx_body_start:idx_body_start + n_body] = new_norms
+
+        return new_vel, new_omega, new_theta, new_cm
+
+
+    # ==============================================================================
+    # 4.  FONCTIONS DU CLAPET (FLAP WAVEMAKER)
+    # ==============================================================================
+
+    def build_flap_particles(H_water, dx, n_layers=3):
+        """
+        Crée les particules du clapet wavemaker.
+        Le clapet est initialement vertical, axe en (0, 0).
+        n_layers couches de particules dans l'épaisseur du clapet.
+        Retourne : positions, normales initiales, hauteurs y0 de chaque particule.
+        """
+        y_vals = np.arange(dx/2, H_water + dx/2, dx)
+        n_pts  = len(y_vals)
+
+        pos_f, nrm_f, y0_f = [], [], []
+        for l in range(n_layers):
+            offset = -(l + 0.5) * dx      # particules à gauche de x=0
+            for y0 in y_vals:
+                pos_f.append([offset, y0])
+                nrm_f.append([1.0, 0.0])  # normale initiale vers +x (vers le fluide)
+                y0_f.append(y0)           # distance à l'axe de rotation
+
+        return (np.array(pos_f),
+                np.array(nrm_f),
+                np.array(y0_f))
+
+
+    def update_flap_particles(pos_all, vel_all, wall_normals,
+                              t, idx_flap_start, n_flap, n_layers,
+                              y0_arr, dx):
+        """
+        Met à jour les positions, vitesses et normales des particules du clapet.
+
+        Pour le clapet en rotation autour de (0, 0) avec angle θ et vitesse θ̇ :
+          Particule à distance y0 de l'axe, couche l (offset = -(l+0.5)*dx) :
+
+            x(t) =  y0 * sin(θ) - offset * cos(θ)
+            y(t) =  y0 * cos(θ) + offset * sin(θ)
+
+            ẋ(t) = (y0 * cos(θ) + offset * sin(θ)) * θ̇
+            ẏ(t) = (-y0 * sin(θ) + offset * cos(θ)) * θ̇
+
+          Normale (pointant vers +x dans la configuration initiale) :
+            n = [cos(θ), -sin(θ)]
+        """
+        theta    = flap_angle(t)
+        thetadot = flap_angular_velocity(t)
+        ct, st   = np.cos(theta), np.sin(theta)
+
+        n_per_layer = n_flap // n_layers
+
+        for l in range(n_layers):
+            offset = -(l + 0.5) * dx   # même logique que build_flap_particles
+            for j in range(n_per_layer):
+                idx = idx_flap_start + l * n_per_layer + j
+                y0  = y0_arr[l * n_per_layer + j]
+
+                # --- FORMULES CORRIGÉES ---
+                # Si theta=0 : x = offset (négatif), y = y0 (vertical)
+                pos_all[idx, 0] = offset * ct + y0 * st
+                pos_all[idx, 1] = -offset * st + y0 * ct
+
+                # Vitesse : v = omega x r
+                vel_all[idx, 0] = (pos_all[idx, 1]) * thetadot
+                vel_all[idx, 1] = (-pos_all[idx, 0]) * thetadot
+
+        # Normale : perpendiculaire au clapet, pointant vers le fluide
+        wall_normals[idx_flap_start:idx_flap_start + n_flap, 0] =  ct
+        wall_normals[idx_flap_start:idx_flap_start + n_flap, 1] = -st
+
+
+    # ==============================================================================
+    # 5.  MESURE DES SONDES ET COMPARAISON EXPÉRIMENTALE
+    # ==============================================================================
+
+    def measure_surface_elevation(pos, types, rho, rho0, x_probe, h_sph):
+        """
+        Élévation de surface à la sonde x_probe.
+        Méthode : interpolation Shepard de ρ sur la colonne, puis détection
+        du niveau ρ = ρ0/2 (interface eau/air SPH).
+        Fallback : position de la plus haute particule fluide dans |x-x_p| < h.
+        """
+        mask_f = (types == FLUID)
+        band   = mask_f & (np.abs(pos[:, 0] - x_probe) < h_sph)
+
+        if not np.any(band):
+            return 0.0
+
+        # Méthode rapide : plus haute particule dans la bande
+        y_top = np.max(pos[band, 1])
+        return y_top - H_water
+
+
+    def load_experimental(data_dir='.'):
+        """
+        Charge les fichiers expérimentaux du Test 12 SPHERIC
+        (télécharger SPHERIC_TestCase12.zip sur spheric-sph.org).
+        """
+        exp = {}
+        files = {
+            'Elevation.dat': ['t1', 'eta1', 't2', 'eta2'],
+            'Motions.dat'  : ['t_h', 'heave', 't_s', 'sway'],
+            'Rotation.dat' : ['t_r', 'roll'],
+        }
+        for fname, keys in files.items():
+            fpath = os.path.join(data_dir, fname)
+            if os.path.exists(fpath):
+                data = np.genfromtxt(fpath, comments='#', skip_header=1, invalid_raise=False)
+                for i, k in enumerate(keys):
+                    exp[k] = data[:, i]
+                print(f"[OK] {fname} chargé ({len(data)} points)")
+            else:
+                print(f"[INFO] {fname} non trouvé — pas de comparaison pour ce jeu")
+        return exp
+
+
+    def write_probe_ascii(vtk_dir, t_arr, eta1_arr, eta2_arr,
+                          heave_arr, sway_arr, roll_arr, cm_arr):
+        """Écrit les fichiers de sortie au format SPHERIC."""
+        # Élévation de surface
+        out = np.column_stack([t_arr, eta1_arr, t_arr, eta2_arr])
+        np.savetxt(os.path.join(vtk_dir, 'SPH_Elevation.dat'), out,
+                   header='Time(s)  Probe1_eta(m)  Time(s)  Probe2_eta(m)',
+                   fmt='%.6f')
+        # Mouvements du corps
+        out = np.column_stack([t_arr, heave_arr, t_arr, sway_arr])
+        np.savetxt(os.path.join(vtk_dir, 'SPH_Motions.dat'), out,
+                   header='Time(s)  Heave(m)  Time(s)  Sway(m)',
+                   fmt='%.6f')
+        # Rotation
+        out = np.column_stack([t_arr, roll_arr])
+        np.savetxt(os.path.join(vtk_dir, 'SPH_Rotation.dat'), out,
+                   header='Time(s)  Roll(degrees)',
+                   fmt='%.6f')
+        # Trajectoire du centre de masse
+        out = np.column_stack([t_arr, cm_arr])
+        np.savetxt(os.path.join(vtk_dir, 'SPH_BodyCM.dat'), out,
+                   header='Time(s)  CM_x(m)  CM_y(m)',
+                   fmt='%.6f')
+        print(f"[OK] Fichiers ASCII écrits dans {vtk_dir}/")
+
+
+    def plot_comparison(vtk_dir, t_arr, eta1, eta2, heave, sway, roll, exp):
+        """
+        Génère les figures de comparaison SPH vs expérience.
+        Les figures sont enregistrées en PNG dans vtk_dir.
+        """
+        fig, axes = plt.subplots(3, 2, figsize=(14, 10))
+        fig.suptitle('SPHERIC Test 12 — SPH-ALE vs Expérience', fontsize=14, fontweight='bold')
+
+        # Sonde 1 — avant le corps
+        ax = axes[0, 0]
+        ax.plot(t_arr, eta1 * 100, 'b-', lw=1.5, label='SPH-ALE')
+        if 't1' in exp:
+            ax.plot(exp['t1'], exp['eta1'] * 100, 'k--', lw=1, alpha=0.8, label='Expérience')
+        ax.set_xlabel('Temps [s]')
+        ax.set_ylabel('η [cm]')
+        ax.set_title(f'Élévation surface — Sonde 1 (x={x_probe1:.2f}m)')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Sonde 2 — après le corps
+        ax = axes[0, 1]
+        ax.plot(t_arr, eta2 * 100, 'r-', lw=1.5, label='SPH-ALE')
+        if 't2' in exp:
+            ax.plot(exp['t2'], exp['eta2'] * 100, 'k--', lw=1, alpha=0.8, label='Expérience')
+        ax.set_xlabel('Temps [s]')
+        ax.set_ylabel('η [cm]')
+        ax.set_title(f'Élévation surface — Sonde 2 (x={x_probe2:.2f}m)')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Heave
+        ax = axes[1, 0]
+        ax.plot(t_arr, heave * 100, 'b-', lw=1.5, label='SPH-ALE')
+        if 't_h' in exp:
+            ax.plot(exp['t_h'], exp['heave'] * 100, 'k--', lw=1, alpha=0.8, label='Expérience')
+        ax.axhline(0, color='gray', lw=0.5)
+        ax.set_xlabel('Temps [s]')
+        ax.set_ylabel('Heave [cm]')
+        ax.set_title('Mouvement vertical du corps (heave)')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Sway
+        ax = axes[1, 1]
+        ax.plot(t_arr, sway * 100, 'g-', lw=1.5, label='SPH-ALE')
+        if 't_s' in exp:
+            ax.plot(exp['t_s'], exp['sway'] * 100, 'k--', lw=1, alpha=0.8, label='Expérience')
+        ax.axhline(0, color='gray', lw=0.5)
+        ax.set_xlabel('Temps [s]')
+        ax.set_ylabel('Sway [cm]')
+        ax.set_title('Mouvement horizontal du corps (sway)')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Roll
+        ax = axes[2, 0]
+        ax.plot(t_arr, roll, 'purple', lw=1.5, label='SPH-ALE')
+        if 't_r' in exp:
+            ax.plot(exp['t_r'], exp['roll'], 'k--', lw=1, alpha=0.8, label='Expérience')
+        ax.axhline(0, color='gray', lw=0.5)
+        ax.set_xlabel('Temps [s]')
+        ax.set_ylabel('Roll [°]')
+        ax.set_title('Rotation du corps (roll)')
+        ax.legend(); ax.grid(True, alpha=0.3)
+
+        # Erreur RMS si données dispo
+        ax = axes[2, 1]
+        if 't_h' in exp and len(t_arr) > 10:
+            f_heave_exp = interp1d(exp['t_h'], exp['heave'], bounds_error=False, fill_value=0)
+            f_sway_exp  = interp1d(exp['t_s'], exp['sway'],  bounds_error=False, fill_value=0)
+            err_h = heave - f_heave_exp(t_arr)
+            err_s = sway  - f_sway_exp(t_arr)
+            ax.plot(t_arr, np.abs(err_h)*100, 'b-',  lw=1, label='|Erreur heave|')
+            ax.plot(t_arr, np.abs(err_s)*100, 'g--', lw=1, label='|Erreur sway|')
+            ax.set_xlabel('Temps [s]')
+            ax.set_ylabel('|Erreur| [cm]')
+            ax.set_title('Erreur absolue SPH vs Expérience')
+            ax.legend(); ax.grid(True, alpha=0.3)
+            rms_h = np.sqrt(np.mean(err_h**2)) * 100
+            rms_s = np.sqrt(np.mean(err_s**2)) * 100
+            ax.set_title(f'Erreur abs.  RMS heave={rms_h:.2f}cm  sway={rms_s:.2f}cm')
+        else:
+            ax.text(0.5, 0.5, "Données expérimentales\nnon disponibles\n\n"
+                    "Télécharger SPHERIC_TestCase12.zip\nsur spheric-sph.org",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=11,
+                    color='gray')
+            ax.set_title('Comparaison RMS')
+
+        plt.tight_layout()
+        out_fig = os.path.join(vtk_dir, 'SPHERIC_Test12_comparison.png')
+        plt.savefig(out_fig, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"[OK] Figure comparaison → {out_fig}")
+
+
+    # ==============================================================================
+    # 6.  VTK ÉTENDU (élévation de surface + champs corps)
+    # ==============================================================================
+
+    def write_vtk_wf(filename, pos, vel, v_mesh, pres, types, rho, vol, m,
+                     num_neighbors, shepard, wall_normals,
+                     body_cm, body_theta, body_vel, body_omega):
+        """VTK enrichi avec les champs spécifiques WaveFloat."""
+        n = len(pos)
+        with open(filename, 'w') as f:
+            f.write("# vtk DataFile Version 3.0\nSPH_WAVEFLAT\nASCII\nDATASET POLYDATA\n")
+            f.write(f"POINTS {n} float\n")
+            for p in pos:
+                f.write(f"{p[0]:.6f} {p[1]:.6f} 0.0\n")
+            f.write(f"\nVERTICES {n} {2*n}\n")
+            for i in range(n):
+                f.write(f"1 {i}\n")
+            f.write(f"\nPOINT_DATA {n}\n")
+            # Champs scalaires
+            for name, arr in [('Pressure', pres), ('Density', rho),
+                               ('Volume', vol), ('Shepard', shepard), ('Mass', m)]:
+                f.write(f"SCALARS {name} float 1\nLOOKUP_TABLE default\n")
+                for v in arr:
+                    f.write(f"{float(v):.6f}\n")
+            f.write("SCALARS Type int 1\nLOOKUP_TABLE default\n")
+            for tp in types:
+                f.write(f"{int(tp)}\n")
+            f.write("SCALARS Neighbors int 1\nLOOKUP_TABLE default\n")
+            for nb in num_neighbors:
+                f.write(f"{int(nb)}\n")
+            # Champs vectoriels
+            for name, arr in [('Velocity', vel), ('VelocityMesh', v_mesh),
+                               ('WallNormals', wall_normals)]:
+                f.write(f"VECTORS {name} float\n")
+                for v in arr:
+                    f.write(f"{v[0]:.6f} {v[1]:.6f} 0.0\n")
+
+
+    # ==============================================================================
+    # 7.  INITIALISATION DU CAS WaveFloat
+    # ==============================================================================
+
+    print("\n" + "="*60)
+    print("  INITIALISATION — SPHERIC Test 12 WaveFloat")
+    print("="*60)
+
+    # ---- 7a. Clapet wavemaker ----
+    pos_flap, nrm_flap, y0_arr = build_flap_particles(H_water, dx, n_layers)
+    n_flap = len(pos_flap)
+    print(f"Clapet wavemaker : {n_flap} particules ({n_layers} couches)")
+
+    # ---- 7b. Corps flottant ----
+    pos_body_pts, nrm_body0, rel_pos0 = build_floating_body(
+        x_body_init, y_body_init, L_body, H_body, dx
+    )
+    n_body = len(pos_body_pts)
+
+    # ---- 7c. Murs du bassin (fond + mur droit) ----
+    pos_wall_list, nrm_wall_list = [], []
+
+    # Fond (y < 0) — n_layers couches sous le bassin
+    for l in range(n_layers):
+        xs_bot = np.arange(-n_layers * dx, L_tank + n_layers * dx + dx/2, dx)
+        for xi in xs_bot:
+            pos_wall_list.append([xi, -(l + 0.5) * dx])
+            nrm_wall_list.append([0.0, 1.0])
+
+    # Mur droit (x > L_tank)
+    for l in range(n_layers):
+        ys_rgt = np.arange(-n_layers * dx, H_water + n_layers * dx + dx/2, dx)
+        for yi in ys_rgt:
+            pos_wall_list.append([L_tank + (l + 0.5) * dx, yi])
+            nrm_wall_list.append([-1.0, 0.0])
+
+    pos_wall = np.array(pos_wall_list)
+    nrm_wall = np.array(nrm_wall_list)
+    n_wall   = len(pos_wall)
+    print(f"Murs du bassin   : {n_wall} particules")
+
+    # ---- 7d. Fluide (grille régulière, exclusion zone corps) ----
+    pos_fluid_list = []
+    for xi in np.arange(dx/2, L_tank, dx):
+        for yi in np.arange(dx/2, H_water, dx):
+            in_body = (abs(xi - x_body_init) <= L_body/2 + dx/2 and
+                       abs(yi - y_body_init) <= H_body/2 + dx/2)
+            if not in_body:
+                pos_fluid_list.append([xi, yi])
+
+    pos_fluid = np.array(pos_fluid_list)
+    n_fluid   = len(pos_fluid)
+    print(f"Fluide           : {n_fluid} particules")
+
+    # ---- 7e. Assemblage global ----
+    #  Ordre : WALL | FLAP | BODY | FLUID
+    idx_wall_start  = 0
+    idx_flap_start  = n_wall
+    idx_body_start  = n_wall + n_flap
+    idx_fluid_start = n_wall + n_flap + n_body
+
+    pos   = np.vstack([pos_wall, pos_flap, pos_body_pts, pos_fluid])
+    types = np.concatenate([
+        np.full(n_wall,  WALL),
+        np.full(n_flap,  FLAP),
+        np.full(n_body,  BODY),
+        np.full(n_fluid, FLUID),
+    ])
+    n_p   = len(pos)
+    print(f"TOTAL            : {n_p} particules")
+
+    # ---- 7f. Normales globales ----
+    wall_normals = np.zeros((n_p, 2))
+    wall_normals[idx_wall_start  : idx_flap_start]  = nrm_wall
+    wall_normals[idx_flap_start  : idx_body_start]  = nrm_flap
+    wall_normals[idx_body_start  : idx_fluid_start] = nrm_body0
+
+    # ---- 7g. Conditions initiales (physique) ----
+    vel  = np.zeros((n_p, 2))
+    rho  = np.full(n_p, rho0)
+    pres = np.zeros(n_p)
+    vol  = np.full(n_p, dx**2)
+    m    = np.zeros(n_p)
+
+    # Fluide : pression hydrostatique initiale
+    mask_f    = (types == FLUID)
+    y_fl      = pos[mask_f, 1]
+    pres[mask_f] = rho0 * g_acc * np.maximum(0.0, H_water - y_fl) + P_b
+    rho[mask_f]  = get_density(pres[mask_f])
+    m[mask_f]    = rho[mask_f] * vol[mask_f]
+
+    # Murs et clapet
+    mask_wf        = (types == WALL) | (types == FLAP)
+    rho[mask_wf]   = rho0
+    m[mask_wf]     = rho0 * dx**2
+
+    # Corps flottant : masse répartie uniformément
+    m_part_body    = mass_body_2D * dx**2 / (L_body * H_body)
+    mask_body_g    = (types == BODY)
+    m[mask_body_g] = m_part_body
+    rho[mask_body_g] = rho_body
+    pres[mask_body_g] = 0.0
+
+    # ---- 7h. État du corps rigide ----
+    body_vel   = np.array([0.0, 0.0])   # [vx, vy] du CM
+    body_omega = 0.0                     # vitesse angulaire [rad/s]
+    body_theta = 0.0                     # angle cumulé [rad]
+    body_cm    = np.array([x_body_init, y_body_init])
+
+    # Normales initiales du corps (pour la rotation)
+    nrm_body0_global = nrm_body0.copy()
+
+    # ---- 7i. Données de suivi (sondes + corps) ----
+    probe_t    = []
+    probe_eta1 = []
+    probe_eta2 = []
+    body_heave = []   # déplacement vertical CM (= body_cm[1] - y_body_init)
+    body_sway  = []   # déplacement horizontal CM (= body_cm[0] - x_body_init)
+    body_roll  = []   # angle θ en degrés
+    body_cm_hist = [] # historique CM [x, y]
+
+    # ---- 7j. Initialisation de la boucle ----
+    num_neighbors = np.zeros(n_p, dtype=int)
+    shepard_coeff = np.zeros(n_p)
+    drho          = np.zeros(n_p)
+    accel         = np.zeros((n_p, 2))
+    v_mesh        = np.zeros((n_p, 2))
+    S_G_local     = np.zeros(n_p)
+    S_dist        = np.zeros(n_p)
+    grad_S_G      = np.zeros((n_p, 2))
+    grad_S_dist   = np.zeros((n_p, 2))
+
+    t, step, dt = 0.0, 0, CFL * h / c0
+    print(f"\nΔt initial : {dt:.6f} s")
+
+    # Chargement des données expérimentales (si disponibles)
+    exp_data = load_experimental('.')
+
+    print("\nDémarrage de la boucle temporelle...")
+    print("-" * 60)
+    
+
+
+
+
+#--------------------------------------------------------------------------------------------------------------------- 
+if testCase =='car':
+    # --------------------------
+    # Initialisation Scène
+    # --------------------------
+    # 1. Murs du bac
+    # --------------------------
+    # Initialisation Scène (Quai + Bassin)
+    # --------------------------
+    
+    # 1. Murs du bac et du quai
+    layers = 5
+    # -------------------------------
+    # 1. Création des murs du bac
+    # -------------------------------
+    x_wall = []
+    y_wall = []
+
+    # Plateau gauche horizontal
+    x_plateau = np.arange(0, L_plateau + dx, dx)
+    y_plateau = np.zeros_like(x_plateau) + H_water
+    for l in range(layers):
+        x_wall.extend(x_plateau)
+        y_wall.extend(y_plateau - l*dx)
+
+    # Pente descendante
+    x_slope = np.arange(L_plateau, L_plateau + L_slope + dx, dx)
+    y_slope = H_water - np.tan(theta) * (x_slope - L_plateau)
+    for l in range(layers):
+        x_wall.extend(x_slope)
+        y_wall.extend(y_slope - l*dx)
+
+    # Plateau fond du bac
+    x_bottom = np.arange(L_plateau + L_slope, L_plateau + L_slope + L_bottom + dx, dx)
+    y_bottom = np.full_like(x_bottom, y_slope[-1])
+    for l in range(layers):
+        x_wall.extend(x_bottom)
+        y_wall.extend(y_bottom - l*dx)
+
+    # Remontée symétrique
+    x_rise = np.arange(L_plateau + L_slope + L_bottom, L_plateau + L_slope + L_bottom + L_rise + dx, dx)
+    y_rise = y_bottom[-1] + np.tan(theta) * (x_rise - x_rise[0])
+    for l in range(layers):
+        x_wall.extend(x_rise)
+        y_wall.extend(y_rise - l*dx)
+
+    # Plateau final horizontal
+    x_plateau2 = np.arange(x_rise[-1], x_rise[-1] + L_plateau_right + dx, dx)
+    y_plateau2 = np.full_like(x_plateau2, y_rise[-1])
+    for l in range(layers):
+        x_wall.extend(x_plateau2)
+        y_wall.extend(y_plateau2 - l*dx)
+
+    pos_wall = np.vstack([x_wall, y_wall]).T
+
+    # -------------------------------
+    # 2. Création du fluide
+    # -------------------------------
+    x_fluid = np.arange(0, L_plateau + L_slope + L_bottom + L_rise + L_plateau_right, dx)
+    H_fluid = H_water  # profondeur d'eau
+    target_surface_level = H_water
+    # -------------------------------
+    # 2. Création du fluide (uniquement dans le bassin)
+    # -------------------------------
+    x_f, y_f = [], []
+
+    # On définit les limites du bassin pour ne pas remplir les plateaux
+    x_start_basin = L_plateau
+    x_end_basin = L_plateau + L_slope + L_bottom + L_rise
+
+    for x in x_fluid:
+        # Check if x is within the basin zone
+        if x_start_basin <= x <= x_end_basin:
+            
+            # (Calculation of y_bac is identical as before)
+            if x <= L_plateau + L_slope:
+                y_bac = H_water - np.tan(theta) * (x - L_plateau)
+            elif x <= L_plateau + L_slope + L_bottom:
+                y_bac = H_water - np.tan(theta) * L_slope
+            else:
+                y_bac = (H_water - np.tan(theta) * L_slope) + np.tan(theta) * (x - (L_plateau + L_slope + L_bottom))
+
+            # --- KEY CHANGE FOR BULK FILLING ---
+            
+            # Calculate the total vertical space to fill
+            total_height_to_fill = target_surface_level - y_bac
+            
+            # Determine how many particles fit in this space, 
+            # starting one dx above the floor and stopping just below the surface.
+            n_layers_to_fill = int((total_height_to_fill - dx) / dx)
+
+            # Bulk fill loop
+            for i in range(1, n_layers_to_fill + 3): 
+                y_particle = y_bac + i * dx
+                
+                # Double-check we don't exceed the target level
+                if y_particle < target_surface_level+dx:
+                    x_f.append(x)
+                    y_f.append(y_particle)
+
+    
+    pos_fluid = np.vstack([x_f, y_f]).T
+    if randompos:
+        pos_fluid += (np.random.rand(*pos_fluid.shape) - 0.5) * randomlength  * dx
+    # 3. Voiture (Positionnée sur le quai à gauche)
+    
+    pos_car, m_car_part, car_I, car_normals_init = create_car(posXinitCar, posYinitCar, car_mass)
+    
+     # Assemblage
+    pos = np.vstack([pos_wall, pos_fluid, pos_car])
+    types = np.concatenate([np.full(len(pos_wall), WALL), np.full(len(pos_fluid), FLUID), np.full(len(pos_car), CAR)])
+    n_p=len(pos) 
+    
+     # On la place à x = -1.0, juste au dessus du quai (H_quay + rayon de sécurité)
+    # 1. Initialisation du vecteur des normales pour toutes les particules
+    # -------------------------------
+    # 5. Initialisation des normales
+    # -------------------------------
+    wall_normals = np.zeros((n_p,2))
+
+    # Normales murs/pentes
+    mask_wall = (types == WALL)
+    wall_normals[mask_wall] = [0,1]  # initial vertical
+
+    # Plateau gauche
+    mask_plateau = (pos[:,0] <= L_plateau) & mask_wall
+    wall_normals[mask_plateau] = [0,1]
+
+    # Pente descendante
+    mask_slope = (pos[:,0] > L_plateau) & (pos[:,0] <= L_plateau + L_slope) & mask_wall
+    wall_normals[mask_slope] = [np.sin(theta), np.cos(theta)]
+
+        # Plateau fond
+    mask_bottom = (pos[:,0] > L_plateau + L_slope) & (pos[:,0] <= L_plateau + L_slope + L_bottom) & mask_wall
+    wall_normals[mask_bottom] = [0,1]
+
+    # Remontée
+    mask_rise = (pos[:,0] > L_plateau + L_slope + L_bottom) & (pos[:,0] <= L_plateau + L_slope + L_bottom + L_rise) & mask_wall
+    wall_normals[mask_rise] = [-np.sin(theta), np.cos(theta)]
+
+    # Plateau final
+    mask_plateau2 = (pos[:,0] > L_plateau + L_slope + L_bottom + L_rise) & mask_wall
+    wall_normals[mask_plateau2] = [0,1]
+
+    # 3. Assignation pour la voiture (mobiles)
+    # On récupère les normales calculées par create_car
+    
+    wall_normals[types == CAR] = car_normals_init
+
+    # 4. Nettoyage : s'assurer que les fluides ont une normale nulle
+    wall_normals[types == FLUID] = [0, 0]
+        
+    car_vel = np.array([carvitesse, 0.0]) # Vitesse horizontale vers le bassin (2.5 m/s)
+    car_omega = 0.0   
+    rho, pres = np.zeros(n_p), np.zeros(n_p)
+    m = np.zeros(n_p)
+    # États
+    vel = np.zeros((n_p, 2))
+    vel[types == CAR] = car_vel
+    # Fluid
+    mask_f = (types == FLUID)
+    y_fluid = pos[mask_f, 1]
+    pres[mask_f] = rho0 * g_acc * np.maximum(0.0, (1.0 - (0.7+y_fluid))) + P_b
+    rho[mask_f] = get_density(pres[mask_f])
+    m [mask_f] =rho[mask_f]*dx**2
+    # Wall
+    mask_wall = (types == WALL)
+    rho[mask_wall] = rho0
+    pres[mask_wall] =0
+    m [mask_wall] =rho[mask_wall]*dx**2
+    # Car
+    m[types == CAR] = m_car_part
+    rho[types == CAR] = m_car_part / (dx**2)
+    pres[types == CAR] = 0
+    vol = m / rho
+    num_neighbors = np.zeros(n_p, dtype=int) 
+    shepard_coeff = np.zeros(n_p)
+    t, step, dt = 0.0, 0, 0.01 * h / (c0+ carvitesse)
+    
+#---------------------------------------------------------------------------------------------------------------------    
+if testCase == 'TGV' or testCase =='TGVmesh':
+    print("\n Initialisation")
+    x=np.arange(dx/2,L,dx)
+    X,Y=np.meshgrid(x,x)
+    pos=np.column_stack((X.ravel(),Y.ravel()))
+    if randompos:
+        np.random.seed(42)
+        pos += np.random.uniform(-0.1*dx, 0.1*dx, pos.shape)
+    
+    n=len(pos)
+    vel,p_init=get_tgv_solution(pos, 0, L, U0, nu)
+    rho=rho0*(1+p_init/(rho0*c0*c0))
+    vol=np.ones(n)*dx*dx
+    m=rho*vol
+    vmesh=np.zeros_like(vel)
+    #=types = np.array([TYPE_FLUID]*n )
+    t, step, dt = 0.0, 0, 0.01 * h / c0
+    num_neighbors = np.zeros(n, dtype=int)
+    shepard_coeff = np.zeros(n)  
+           
+    wall_normals  = np.zeros((n, 2))
+    pres = get_pressure(rho)                
+    types =  np.full(len(pos), FLUID)
+    mask_f = (types == FLUID)
+    print("\nDémarrage de la boucle temporelle...")
+#--------------------------------------------------------------------------------------------------------------------- 
+if testCase == 'DamBreak':
+    box_w, box_h, layers = 4.0, 4.0, 5  #4 par 4 à terme
+    # On s'assure que les murs finissent juste avant 0
+    x_wall = np.arange(-layers*dx, box_w + layers*dx, dx)
+    y_wall = np.arange(-layers*dx, box_h, dx)
+    x_grid, y_grid = np.meshgrid(x_wall, y_wall)
+    p_grid = np.vstack([x_grid.ravel(), y_grid.ravel()]).T
+
+    # Masque pour ne garder que le "U" de la boite
+    mask_wall = (p_grid[:,1] < 0) | (p_grid[:,0] < 0) | (p_grid[:,0] > box_w - dx)
+    pos_wall = p_grid[mask_wall]
+    types_wall = np.full(len(pos_wall), WALL)
+
+    # Calcul des normales géométriques (Unitaires)
+    wall_normals = np.zeros((len(pos_wall), 2))
+    for i, p in enumerate(pos_wall):
+    # Mur Gauche (x < 0) -> Normale vers la droite (1, 0)
+        if p[0] < 0:
+            wall_normals[i] = [1.0, 0.0]
+        # Mur Droit (x > box_w - dx) -> Normale vers la gauche (-1, 0)
+        elif p[0] > box_w - 1.5*dx:
+            wall_normals[i] = [-1.0, 0.0]
+        # Fond (y < 0) -> Normale vers le haut (0, 1)
+        if p[1] < 0:
+            # Gestion des coins : on additionne et normalise
+            wall_normals[i] += [0.0, 1.0]
+    
+        # Normalisation pour avoir un vecteur unitaire
+        norm = np.linalg.norm(wall_normals[i])
+        if norm > 1e-9:
+            wall_normals[i] /= norm
+
+
+    # --- Grille Fluide ---
+    # On commence à 0.0 pour être contre le mur, 
+    # mais on s'assure que le mur n'occupe pas l'espace >= 0 à l'intérieur
+    xf, yf = np.meshgrid(np.arange(0, L_column, dx), 
+                     np.arange(0, H_column, dx))
+    pos_fluid = np.vstack([xf.ravel(), yf.ravel()]).T
+    if randompos:
+        pos_fluid += (np.random.rand(*pos_fluid.shape) - 0.5) * noise_amp  * dx
+    
+    # Extension du tableau des normales à toutes les particules (0 pour le fluide)
+    normals = np.zeros((len(pos_wall) + len(pos_fluid), 2))
+    normals[:len(pos_wall)] = wall_normals
+    pos = np.vstack([pos_wall, pos_fluid])
+    types = np.concatenate([types_wall, np.full(len(pos_fluid), FLUID)])
+    n_p = len(pos)
+
+    vel, vol = np.zeros((n_p, 2)), np.full(n_p, dx**2)
+    rho, pres = np.zeros(n_p), np.zeros(n_p)
+
+    mask_f = (types == FLUID)
+    mask_wall = (types == WALL)
+    y_fluid = pos[mask_f, 1]
+    
+    pres[mask_f] = rho0 * g_acc * np.maximum(0.0, (H_column - y_fluid)) + P_b
+    rho[mask_f] = get_density(pres[mask_f])
+    
+    
+    
+    if Periodic: 
+        tree = cKDTree(pos, boxsize=L)
+    else :
+        tree = cKDTree(pos)
+
+    
+    
+
+    # --------------------------
+    # Boucle Temporelle
+    # --------------------------
+    t, step, dt = 0.0, 0, 0.01 * h / c0
+
+
+    vel[types == FLUID] = 0
+    vel[types == WALL]  = 0
+    rho[types == WALL]  = rho0
+    pres[types==WALL] = 0.0
+    vol[mask_wall] = dx**2
+    m=rho*vol
+    #d_m = np.zeros(n_p)
+    drho = np.zeros(n_p)
+
+    accel = np.zeros((n_p, 2))
+    num_neighbors = np.zeros(n_p, dtype=int)
+    shepard_coeff = np.zeros(n_p)
+    E_history = []    
+    time_history = []
+    
+    
+#--------------------------------------------------------------------------------------------------------------------- 
+if testCase == 'funnel':
+    # --- Génération des Murs (Lisses) ---
+    pos_wall = generate_funnel_wall(dx, n_layers)
+
+    # --- Génération du Fluide ---
+    # --- Génération du Fluide (Adaptée à la forme) ---
+    pos_fluid_list = []
+
+    # On définit les hauteurs (y) de chaque rangée de particules fluides
+    y_fluid_levels = np.arange(dx, H_column-space*dx, dx)
+
+    for y in y_fluid_levels:
+        # Rayon maximal disponible à cette hauteur (avec une petite marge dx)
+        R_max_fluid = get_funnel_radius(y) - dx
+    
+        # Nombre de particules pouvant tenir sur cette ligne
+        # On centre la ligne sur x = 0
+        n_particles_row = int(2 * R_max_fluid / dx)
+    
+        if n_particles_row > 0:
+            # On génère les x de manière symétrique et régulière
+            x_row = np.linspace(-R_max_fluid, R_max_fluid, n_particles_row)
+            for x in x_row:
+                pos_fluid_list.append([x, y])
+
+    pos_fluid = np.array(pos_fluid_list)
+    pos_fluid = np.asarray(pos_fluid).reshape(-1,2)
+    if randompos :    
+        pos_fluid = add_position_noise(pos_fluid, noise_amp)
+    
+    # --- Après avoir défini pos_wall et pos_fluid ---
+    pos = np.vstack([pos_wall, pos_fluid])
+    types = np.concatenate([np.full(len(pos_wall), WALL), np.full(len(pos_fluid), FLUID)])
+    n_p = len(pos)
+    # --- Juste après la génération de pos_wall ---
+    wall_normals = np.zeros((len(pos),2))
+    wall_normals[types==WALL] = compute_wall_normals(pos_wall)
+
+    # Initialisation des tableaux à la bonne taille
+    vel = np.zeros((n_p, 2))
+    rho = np.full(n_p, rho0)
+    pres = np.zeros(n_p)
+    vol = np.full(n_p, dx**2)
+    m = np.zeros(n_p)
+
+    m = rho * vol
+    # --- Définition des masques initiaux ---
+    mask_f = (types == FLUID)
+    mask_w = (types == WALL)
+
+    # 1. Calcul du volume SPH réel (1/somme des noyaux)
+    if Periodic: 
+        tree = cKDTree(pos, boxsize=L)
+    else :
+        tree = cKDTree(pos)
+    sum_w = np.zeros(n_p)
+    # Utilisation d'une requête globale plus rapide
+    vol[:] = dx**2
+    # 2. Pression hydrostatique théorique
+    # On utilise la hauteur maximale du fluide pour le calcul (H_column)
+    y_fluid = pos[mask_f, 1]
+    p_hydro = 0.0#rho0 * g_acc * np.maximum(0.0, (H_column - y_fluid))
+    if Initcase : 
+        p_hydro = rho0 * g_acc * np.maximum(0.0, (H_column - y_fluid))
+    else:
+        p_hydro = 0.0
+    
+    pres[mask_f] = p_hydro + P_b
+    rho[mask_f] = get_density(pres[mask_f])
+
+
+    
+    m[mask_f] = rho[mask_f] * vol[mask_f]
+
+    # Pour les murs : densité de base et masse calculée sur le volume SPH
+    rho[mask_w] = rho0
+    pres[mask_w] = 0.0
+    m[mask_w] = rho0 * vol[mask_w]
+#e_int[mask_f] = pres[mask_f] / ((gamma - 1.0) * rho[mask_f])
+#E[mask_f] = e_int[mask_f] + 0.5 * np.sum(vel[mask_f]**2, axis=1)
+#e = np.zeros(n_p)
+#e[mask_f] = pres[mask_f] / ((gamma - 1) * rho[mask_f])
+
+
+
+# --------------------------
+# Boucle Temporelle
+# --------------------------
+    t, step, dt = 0.0, 0, 0.01 * h / c0
+
+
+    vel[types == FLUID] = 0
+    vel[types == WALL]  = 0
+    rho[types == WALL]  = rho0
+    #d_m = np.zeros(n_p)
+    drho = np.zeros(n_p)
+
+    accel = np.zeros((n_p, 2))
+    num_neighbors = np.zeros(n_p, dtype=int)
+    shepard_coeff = np.zeros(n_p)
+    v_mesh = np.copy(vel)
+    
+    
+    def funnel_height_history(times, pos_history, types_history,
+                  FLUID,
+                  z_exit,
+                  percentile=98):
+        """
+        Compute normalized height H~(t)
+
+        Parameters
+        ----------
+        times : (Nt,)
+        pos_history : list of arrays (N,3)
+        types_history : list
+        z_exit : outlet elevation 0.0
+        """
+
+        H = []
+
+        for pos, types in zip(pos_history, types_history):
+
+            fluid_z = pos[types == FLUID, 1]
+
+            z_surface = np.percentile(fluid_z, percentile)
+
+            H.append(z_surface - 0.0)
+
+        H = np.array(H)
+
+        H0 = H[0]
+
+        H_tilde = H / H0
+
+        return H, H_tilde
+    def funnel_discharge_coefficient(
+        pos,
+        vel,
+        vol,
+        types,
+        FLUID,
+        exit_center,
+        exit_radius,
+        normal,
+        g,
+        H):
+
+        fluid_mask = (types == FLUID)
+
+        pos_f = pos[fluid_mask]
+        vel_f = vel[fluid_mask]
+        vol_f = vol[fluid_mask]
+
+        # distance à la sortie
+        r = np.linalg.norm(pos_f - exit_center, axis=1)
+
+        outlet_mask = r < exit_radius
+
+        if np.sum(outlet_mask) == 0:
+            return 0.0, 0.0
+
+        vel_out = vel_f[outlet_mask]
+        vol_out = vol_f[outlet_mask]
+
+        # projection normale
+        vn = vel_out @ normal
+        # 1. Calculer la hauteur d'eau actuelle (H)
+        # Si pos_fluide est l'ensemble de tes particules fluides
+        if len(pos) > 0:
+            current_z_max = np.max(pos[:, 1])
+            z_exit = 0.020 # À ajuster selon ta géométrie (y1 dans ton code)
+            H = max(0.0, current_z_max - z_exit)
+        else:
+            H = 0.0
+
+        # 2. Calcul du débit théorique sécurisé
+        g = 9.81
+        exit_radius = 0.003 # Rayon du bas de l'entonnoir (R_bottom)
+        Q_theory = np.pi * exit_radius**2 * np.sqrt(2 * g * H)
+        Q = np.sum(vol_out * vn)
+        Cd = Q / Q_theory
+        
+        
+      
+        return Q, Cd
+    def funnel_scaling_law(times, H):
+        """
+        Fit alpha exponent:
+            -dH/dt = K H^alpha
+        """
+
+        dt = np.gradient(times)
+        dHdt = np.gradient(H, times)
+
+        mask = (H > 1e-6) & (dHdt < 0)
+
+        Hfit = H[mask]
+        Y = -dHdt[mask]
+
+        logH = np.log(Hfit)
+        logY = np.log(Y)
+
+        alpha, logK = np.polyfit(logH, logY, 1)
+
+        K = np.exp(logK)
+
+        return alpha, K
+    import numpy as np
+
+    import numpy as np
+
+    def funnel_height(pos,
+                      types,
+                      FLUID,
+                      vertical_axis=1,
+                      z_exit=0.0,
+                      percentile=98,
+                      last_H=None):
+        """
+        Robust funnel height estimator.
+        Works in 2D or 3D.
+
+        vertical_axis :
+            0 -> x vertical
+            1 -> y vertical (MOST 2D SPH)
+            2 -> z vertical (3D SPH)
+        """
+
+        fluid_mask = (types == FLUID)
+
+        # ---- no fluid left ----
+        if np.sum(fluid_mask) == 0:
+            return 0.0 if last_H is None else last_H
+
+        fluid_coord = pos[fluid_mask, vertical_axis]
+
+        if fluid_coord.size == 0:
+            return 0.0 if last_H is None else last_H
+
+        surface = np.percentile(fluid_coord, percentile)
+
+        H = max(surface - 0.0, 0.0)
+
+        return H
+    H_history = []
+    Cd_history = []
+    time_history = []
+    Q_history = []
+#---------------------------------------------------------------------------------------------------------------------     
+if testCase == 'jet':
+    # Initialisation GÉOMÉTRIE (Version Symétrie Parfaite)
+    # --------------------------
+    pos = np.empty((0, 2)); vel = np.empty((0, 2)); types = np.empty(0, dtype=int)
+
+    # 1. Définition précise des lignes de jet
+    # On s'assure que bx est parfaitement centré
+    bx = np.arange(jet_x_min, jet_x_max + dx/2, dx) 
+
+    # Ecartement des jets (on augmente le gap pour la clarté)
+    gap = 0.2  # Augmenté selon ton souhait d'écarter les jets
+    y_inlet_top = y_center + gap
+    y_inlet_bottom = y_center - gap
+
+    # --- Buffers (4 couches de chaque côté) ---
+    # On construit le haut, puis on le reflète pour le bas
+    by_buffer_rel = np.array([0, 1, 2, 3]) * dx
+
+    # Top Buffer
+    p_bt = np.array([[x, y_inlet_top + y] for y in by_buffer_rel for x in bx])
+    pos = np.vstack([pos, p_bt])
+    types = np.concatenate([types, np.full(len(p_bt), BUFFER_TOP)])
+    vel = np.vstack([vel, np.tile([0, -v_jet], (len(p_bt), 1))])
+
+    # Bottom Buffer (Miroir exact)
+    if DOUBLE_JET:
+        p_bb = np.array([[x, y_inlet_bottom - y] for y in by_buffer_rel for x in bx])
+        pos = np.vstack([pos, p_bb])
+        types = np.concatenate([types, np.full(len(p_bb), BUFFER_BOTTOM)])
+        vel = np.vstack([vel, np.tile([0, v_jet], (len(p_bb), 1))])  
+    else:
+        # Création d'un MUR horizontal en bas pour recevoir le jet
+        # On élargit le mur par rapport au jet pour éviter que le fluide ne "fuit" sur les côtés
+        wall_width = (jet_x_max - jet_x_min) * 3.0
+        x_wall = np.arange(jet_x_min - wall_width/3, jet_x_max + wall_width/3 + dx/2, dx)     
+        # On crée 3 à 4 couches de mur pour assurer un support SPH complet
+        p_wall = np.array([[x, y_inlet_bottom - y*0.5*dx] for y in range(n_layers) for x in x_wall])      
+        pos = np.vstack([pos, p_wall])
+        types = np.concatenate([types, np.full(len(p_wall), WALL)])
+        vel = np.vstack([vel, np.zeros((len(p_wall), 2))])        
+        wall_normals = np.zeros((len(pos), 2))
+        # Calcul des normales géométriques (Unitaires)
+        mask_wall = (types == WALL)
+        wall_normals[mask_wall] = [0.0, 1.0]
+    
+        
+    
+    # --- Couches de fluide initiales ---
+    fluid_pos = []
+    fluid_vel = []
+    fluid_types = []
+
+    # On définit le nombre de couches entre le buffer et la zone d'impact
+    # pour laisser un vide central (impact_gap)
+    y_limit_top = y_center + impact_gap/2
+    y_limit_bot = y_center - impact_gap/2
+
+    # Génération symétrique des couches fluides
+    for k in range(1, N_layers + 1):
+        y_off = k * dx
+    
+        # Couche descendante (Haut)
+        y_val_top = y_inlet_top - y_off
+        if y_val_top > y_limit_top + 1e-9:
+            layer = np.array([[x, y_val_top] for x in bx])
+            if randompos:
+                layer = add_position_noise(layer, randomlength*dx)
+            fluid_pos.append(layer)
+            fluid_vel.append(np.tile([0, -v_jet], (len(bx), 1)))
+            fluid_types.append(np.full(len(bx), FLUID))
+        
+        # Couche ascendante (Bas)
+        if DOUBLE_JET:
+            y_val_bot = y_inlet_bottom + y_off
+            if y_val_bot < y_limit_bot - 1e-9:
+                layer = np.array([[x, y_val_bot] for x in bx])
+                if randompos:
+                    layer = add_position_noise(layer, randomlength*dx)
+                fluid_pos.append(layer)
+                fluid_vel.append(np.tile([0, v_jet], (len(bx), 1)))
+                fluid_types.append(np.full(len(bx), FLUID))
+
+    if fluid_pos:
+        pos = np.vstack([pos, np.vstack(fluid_pos)])
+        vel = np.vstack([vel, np.vstack(fluid_vel)])
+        types = np.concatenate([types, np.concatenate(fluid_types)])
+        # --- Juste après la création finale de 'pos' et 'types' dans le bloc 'jet' ---
+        n_init = len(pos)
+    
+           
+
+    t, step,dt = 0.0, 0,0.01*h/c0
+
+    # --- Variables physiques ---
+    n_init = len(pos)
+    rho = np.full(n_init, rho0)
+    pres = np.zeros(n_init)
+    vol = np.full(n_init, dx**2)
+    m = rho * vol
+    shifting_displacement = np.zeros((n_init, 2))
+    num_neighbors = np.zeros(n_init, dtype=int)
+    shepard_coeff = np.zeros(n_init)
+#--------------------------------------------------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------------------------------------------------- 
+# temporal iterations
+#--------------------------------------------------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------------------------------------------------- 
+#--------------------------------------------------------------------------------------------------------------------- 
+if ModeDEBUG: 
+    
+    print("Begin mode debug:")
+    # =====================================
+    # Génération nuage particulaire
+    # =====================================
+    def generate_particles(N):
+        dx_grid = 1.0 / N
+        v = np.linspace(dx_grid / 2, 1.0 - dx_grid / 2, N)
+        X, Y = np.meshgrid(v, v)
+
+        # Ajout d'un bruit (jitter) pour casser la symétrie parfaite
+        np.random.seed(42) # Pour garder le test reproductible
+        noise = (np.random.rand(*X.shape) - 0.5) * 0.2 * dx_grid
+        X += noise
+        Y += noise
+
+        pos = np.column_stack((X.ravel(), Y.ravel()))
+        vol = np.ones(len(pos)) * (dx_grid ** 2)
+        h = 1.5 * dx_grid 
+        tree = cKDTree(pos)
+
+        return pos, vol, h, tree
+
+    # =====================================
+    # Champs tests
+    # =====================================
+    def field_constant(pos):
+        return np.ones(len(pos))
+
+    def field_linear(pos):
+        return 2.0 + 3.0*pos[:,0] - 4.0*pos[:,1]
+
+    def grad_linear_exact(pos):
+        g = np.zeros((len(pos),2))
+        g[:,0]=3.0
+        g[:,1]=-4.0
+        return g
+
+    def field_quadratic(pos):
+        return 100.0*(pos[:,0]**2 + pos[:,1]**2)
+
+    def grad_quadratic_exact(pos):
+        g=np.zeros((len(pos),2))
+        g[:,0]=200.0*pos[:,0]
+        g[:,1]=200.0*pos[:,1]
+        return g
+
+
+    # =====================================
+    # Erreur L2
+    # =====================================
+    def L2_error_interior(num, exact, pos):
+        """Calcule l'erreur L2 uniquement à l'intérieur du domaine [0.2, 0.8]^2"""
+        interior = (pos[:, 0] > 0.2) & (pos[:, 0] < 0.8) & \
+                   (pos[:, 1] > 0.2) & (pos[:, 1] < 0.8)
+        
+        # Si par hasard aucune particule n'est sélectionnée
+        if not np.any(interior):
+            return np.sqrt(np.mean(np.sum((num - exact)**2, axis=1)))
+            
+        return np.sqrt(np.mean(np.sum((num[interior] - exact[interior])**2, axis=1)))
+
+
+    # =====================================
+    # Test d'ordre MLS
+    # =====================================
+    def test_mls_order():
+
+        resolutions=[20,40,80]
+        global types
+        errors_const=[]
+        errors_lin=[]
+        errors_quad=[]
+        dx=[]
+        p_ref=[]
+        cond_MLS=[]
+        for N in resolutions:
+
+            pos,vol,h,tree=generate_particles(N)
+
+            dx.append(1.0/N)
+            p_ref = np.zeros(len(pos))
+            cond_MLS = np.zeros(len(pos))
+            types = np.ones(len(pos)) * FLUID
+            # ---- constant ----
+            f=field_constant(pos)
+            grad=compute_mls_gradients(pos,vol,f,h,tree,p_ref,cond_MLS)
+            errors_const.append(np.linalg.norm(grad))
+
+            # ---- linear ----
+            f=field_linear(pos)
+            grad=compute_mls_gradients(pos,vol,f,h,tree,p_ref,cond_MLS)
+            exact=grad_linear_exact(pos)
+            errors_lin.append(L2_error_interior(grad,exact, pos))
+
+            # ---- quadratic ----
+            f=field_quadratic(pos)
+            grad=compute_mls_gradients(pos,vol,f,h,tree,p_ref,cond_MLS)
+            exact=grad_quadratic_exact(pos)
+            errors_quad.append(L2_error_interior(grad,exact, pos))
+
+        dx=np.array(dx)
+        print("Valeurs brutes errors_lin :", errors_lin)
+        print("Valeurs brutes errors_quad :", errors_quad)
+        order_lin=np.polyfit(np.log(dx),np.log(errors_lin),1)[0]        
+        order_quad=np.polyfit(np.log(dx),np.log(errors_quad),1)[0]
+        
+        print("MLS constant error:",  errors_const)
+        print("MLS linear order:",    order_lin)
+        print("MLS quadratic order:",order_quad)
+
+        
+    def test_renormalization_order():
+
+        resolutions = [20, 40, 80]
+        errors_const = []
+        errors_lin = []
+        errors_quad = []
+        dx = []
+        for N in resolutions:
+            pos, vol, h, _ = generate_particles(N)
+            dx.append(1/N)
+            num_particles = len(pos)
+            # 1. Construction des paires et calcul de L
+            tree = cKDTree(pos)
+            pairs = list(tree.query_pairs(2*h))
+            shepard = np.ones(num_particles)
+            L = np.zeros((num_particles, 2, 2))
+            cond, status = compute_renormalization_matrices_robust(
+                pairs, pos, vol, h, shepard, L)
+            # =======================================================
+            # FONCTION INTERNE : Calcul du gradient SPH brut (Non corrigé)
+            # =======================================================
+            def compute_raw_sph_gradient(field):
+                grad_sph = np.zeros((num_particles, 2))
+                for i, j in pairs:
+                    rij = pos[i] - pos[j] # Attention au signe selon votre kernel_grad
+                    r = np.linalg.norm(rij)
+                    if r < 1e-12 or r > 2.0 * h: continue
+                    
+                    # Calcul du gradient du noyau
+                    g_w, _ = kernel_grad(rij, r, h)
+                    
+                    # Formule SPH classique du gradient : 
+                    # grad(f)_i = Somme_j ( V_j * (f_j - f_i) * gradW_ij )
+                    # Note : Ajustez le signe de (f_j - f_i) ou g_w selon vos conventions habituelles
+                    grad_sph[i] += vol[j] * (field[j] - field[i]) * g_w
+                    grad_sph[j] += vol[i] * (field[i] - field[j]) * (-g_w)
+                return grad_sph
+    
+            # =======================================================
+            # Reconstruction & Correction par la matrice L
+            # =======================================================
+    
+            # ---- Constant ----
+            f = field_constant(pos)
+            grad_raw = compute_raw_sph_gradient(f)
+            grad_corrected = np.einsum("nij,nj->ni", L, grad_raw)
+            errors_const.append(np.linalg.norm(grad_corrected))
+    
+            # ---- Linear ----
+            f = field_linear(pos)
+            grad_exact = grad_linear_exact(pos)
+            
+            grad_raw = compute_raw_sph_gradient(f)
+            # Application de la correction : grad_corrected = L @ grad_raw
+            grad_corrected = np.einsum("nij,nj->ni", L, grad_raw)
+            
+            errors_lin.append(L2_error_interior(grad_corrected, grad_exact, pos))
+    
+            # ---- Quadratic ----
+            f = field_quadratic(pos)
+            grad_exact = grad_quadratic_exact(pos)
+            
+            grad_raw = compute_raw_sph_gradient(f)
+            grad_corrected = np.einsum("nij,nj->ni", L, grad_raw)
+            
+            errors_quad.append(L2_error_interior(grad_corrected, grad_exact, pos))
+    
+        dx = np.array(dx)
+    
+        order_lin = np.polyfit(np.log(dx), np.log(errors_lin), 1)[0]
+        order_quad = np.polyfit(np.log(dx), np.log(errors_quad), 1)[0]
+    
+        print("--- Résultats Renormalisation Corrigés ---")
+        print("Valeurs brutes errors_lin :", errors_lin)
+        print("Valeurs brutes errors_quad :", errors_quad)
+        print("Renorm linear order:", order_lin)
+        print("Renorm quadratic order:", order_quad)
+    
+    
+    
+    test_mls_order()
+    test_renormalization_order()
+    print("end mode debug:")
+
+while t < finaltime and ModeDEBUG == False :
+    
+    
+    
+    
+    if testCase == 'bodyF':
+        # ------------------------------------------------------------------
+        # 8a. Mise à jour des frontières mobiles
+        # ------------------------------------------------------------------
+
+        # Clapet wavemaker : positions et vitesses prescrites
+        update_flap_particles(pos, vel, wall_normals, t,
+                              idx_flap_start, n_flap, n_layers, y0_arr, dx)
+     
+    
+    if testCase == 'jet':
+        pos, vel, types, rho, pres, vol, m, num_neighbors, shepard_coeff = update_jet_buffers(
+        testCase, pos, vel, types, rho, pres, vol, m,
+        num_neighbors, shepard_coeff,bx, dx,
+        y_inlet_top, y_inlet_bottom,
+        v_jet, rho0,
+        BUFFER_TOP, BUFFER_BOTTOM, FLUID,
+        DOUBLE_JET,
+        randompos,
+        add_position_noise
+        )                     
+   #---------------------------------------------------------------------------------------------------------------------  
+    n_current = len(pos) # La taille peut changer à chaque itération    
+    if Periodic: 
+        tree = cKDTree(pos, boxsize=L)
+    else :
+        tree = cKDTree(pos)
+    pairs = list(tree.query_pairs(2*h)) 
+    # --------------------Filtrage passe bas ---------------------------------------
+    if Filtre and (step % stepfiltre == 0 ):  #application du filtre sous condition d'activitation et tous les stepfiltre
+        if (step <endfiltreiteration): #application du filtre qu'au démarrage
+            rho=apply_density_filter(pos, m, rho, vol, types, h,tree)
+            pres = get_pressure(rho)
+      
+     
+                
+    mask_f = (types == FLUID)    
+    # Ré-initialisation à la taille courante   
+    v_mesh = np.zeros((n_current,2))
+    accel = np.zeros((n_current,2))
+    drho = np.zeros(n_current)
+    num_neighbors.fill(0)
+    shepard_coeff.fill(0)
+    L_matrices =np.zeros((n_current, 2, 2))
+    
+    cond_array= np.zeros(n_current)
+    renorm_status= np.zeros(n_current)
+    p_ref= np.zeros(n_current)
+    cond_MLS= np.zeros(n_current)
+    
+    if mode_p_refinement==1:        
+        # 1. Gradients MLS (pour MUSCL)
+        grad_rho = compute_mls_gradients(pos, vol, rho, h, tree,p_ref,cond_MLS)
+        grad_vel = compute_mls_gradients(pos, vol, vel, h, tree,p_ref,cond_MLS)
+        grad_p   = compute_mls_gradients(pos, vol, pres, h, tree,p_ref,cond_MLS)
+    
+    
+   
+    
+    # --- PHASE  : CALCUL DU CHAMP DE SUPPORT (SHEPARD) --- 
+    # On fait un premier passage uniquement pour le voisinage et le shepard  
+    shepard_coeff[:] = kernel_cubic(0,h)*vol[:]              
+    compute_shepard_coefficients(pairs, pos, vol, h,
+                                    shepard_coeff,
+                                    num_neighbors,
+                                    kernel_cubic)
+    if RenormON:            
+            cond_array, renorm_status = compute_renormalization_matrices_robust(pairs, pos, vol, h, shepard_coeff, L_matrices)          
+    # ----- Compute pressure wall or bodyF or car ---- 
+    solid_types = [WALL]
+    if 'CAR' in globals():
+        solid_types.append(CAR)
+    if 'BODY' in globals():
+        solid_types.append(BODY)
+    mask_wall = np.isin(types, solid_types)    
+    pres[mask_wall] = 0.0
+    compute_pressure_wall(pairs, pos, vol, h, kernel_cubic, pres, types, g, rho0)
+    
+   #---- Functional computation- ALE Mesh test validation (only for TGV to begin)
+    if testCase=='TGV' or testCase=='TGVmesh'  :
+        # Calcul de la fonctionnelle AVANT déplacement
+        F1_before, FS_before, _, _, _ = compute_energy_functionals(
+            pos[mask_f], vol[mask_f], h, shepard_coeff[mask_f], pairs
+        )
+        F2_before = F1_before + alpha * FS_before  
+    
+    
+    if mode_RK == 1 :  
+        
+        #---------------------------------------------------------------------------------------------------------------------  
+        # Paramètres de contrôle du Shifting Formulation type PST (Particle Shifting Technique)
+        v_mesh, S_G_local, S_dist, grad_S_G, grad_S_dist = compute_v_mesh_full(pos, vel, vol, h, dt, 
+                                                                                  mesh_mode,shepard_coeff,tree,pairs )
+        #---------------------------------------------------------------------------------------------------------------------  
+        #Compute interactions (except for mesh analysis : testCase TGVmesh)
+        if testCase != 'TGVmesh':
+            for i, j in pairs:
+                if types[i] == FLUID and types[j] == FLUID:
+
+                    compute_fluid_fluid_interaction(
+                        i, j,
+                        pos, vel, v_mesh,
+                        rho, pres, vol, m,
+                        shepard_coeff,
+                        accel, drho,
+                        h, rho0, c0, mu, ViscoONOFF
+                    )
+
+                elif (types[i] == FLUID and types[j] == WALL) or \
+                     (types[i] == WALL and types[j] == FLUID):
+
+                    compute_fluid_wall_interaction(
+                        i, j,
+                        pos, vel, types,
+                        rho, pres, vol, m,
+                        shepard_coeff,
+                        wall_normals,
+                        accel,drho,
+                        h, mu, gamma, ViscoONOFF,
+                        FLUID
+                    )
+                if testCase =='bodyF':
+                    if (types[i] == FLUID and types[j] == FLAP) or \
+                    (types[j] == FLUID and types[i] == FLAP) or \
+                    (types[i] == FLUID and types[j] == BODY) or \
+                    (types[j] == FLUID and types[i] == BODY): 
+                        compute_fluid_wall_interaction(
+                            i, j,
+                            pos, vel, types,
+                            rho, pres, vol, m,
+                            shepard_coeff,
+                            wall_normals,
+                            accel,drho,
+                            h, mu, gamma, ViscoONOFF,
+                            FLUID
+                            )
+                        
+                        
+                    
+                if testCase =='car':
+                    if (types[i] == FLUID and types[j] == CAR) or (types[j] == FLUID and types[i] == CAR) :
+                         compute_fluid_wall_interaction(
+                            i, j,
+                            pos, vel, types,
+                            rho, pres, vol, m,
+                            shepard_coeff,
+                            wall_normals,
+                            accel,drho,
+                            h, mu, gamma, ViscoONOFF,
+                            FLUID
+                            )
+
+                    # Interaction CAR - WALL (Collision simple pour que la voiture roule sur le quai)
+                    # Vérification des types
+                    is_car_wall = (types[i] == CAR and types[j] == WALL)
+                    is_wall_car = (types[j] == CAR and types[i] == WALL)
+
+                    if is_car_wall or is_wall_car:
+                        # Identification de qui est la voiture
+                        idx_c, idx_w = (i, j) if types[i] == CAR else (j, i)
+            
+                        # Appel de la fonction de collision
+                        apply_spring_collision(idx_c, idx_w, pos, vel, accel, types, m, R_car, R_wall) 
+
+        #---------------------------------------------------------------------------------------------------------------------         
+        if testCase =='bodyF':
+            # ------------------------------------------------------------------
+            # 8h. Intégration temporelle du corps flottant (3 DDL)
+            # ------------------------------------------------------------------
+            accel_body_only = accel[idx_body_start:idx_body_start + n_body].copy()
+
+            body_vel, body_omega, body_theta, body_cm = update_floating_body_rk2(
+                pos, vel, accel_body_only, m, types,
+                body_vel, body_omega, body_theta, body_cm,
+                rel_pos0, nrm_body0_global, mass_body_2D, I_body_2D, g,
+                wall_normals, idx_body_start, n_body, dt
+            )            
+            
+            
+        if testCase == 'car': 
+            # 3. Mise à jour du Corps Rigide (La Voiture)
+            mask_car = (types == CAR)
+            # Somme des forces sur la voiture
+            total_force_car = np.sum(m[mask_car, None] * (accel[mask_car] + g), axis=0)
+            car_center = np.mean(pos[mask_car], axis=0)
+            # Somme des moments
+            rel_pos = pos[mask_car] - car_center
+            forces_indiv = m[mask_car, None] * (accel[mask_car] + g)
+            total_torque_car = np.sum(rel_pos[:,0] * forces_indiv[:,1] - rel_pos[:,1] * forces_indiv[:,0])
+
+            # Accélérations rigides
+            acc_rigid = total_force_car / car_mass
+            alpha_rigid = total_torque_car / car_I
+            # Voiture (Mouvement rigide)
+            car_vel += acc_rigid * dt
+            car_omega += alpha_rigid * dt
+
+            # Mise à jour positions et vitesses des particules de la voiture
+            car_center += car_vel * dt
+            d_theta = car_omega * dt
+            rot_mat = np.array([[np.cos(d_theta), -np.sin(d_theta)], [np.sin(d_theta), np.cos(d_theta)]])
+
+            new_rel_pos = np.dot(rel_pos, rot_mat.T)
+            pos[mask_car] = car_center + new_rel_pos
+            vel[mask_car] = car_vel + np.vstack([-car_omega * new_rel_pos[:,1], car_omega * new_rel_pos[:,0]]).T
+        #---------------------------------------------------------------------------------------------------------------------     
+        # Intégration 
+        if np.any(mask_f):
+            rho[mask_f] += drho[mask_f] * dt
+            vol[mask_f] = m[mask_f] / rho[mask_f]
+            vel[mask_f] += (accel[mask_f] + g) * dt
+            pres[mask_f] = get_pressure(rho[mask_f])
+            if mesh_mode == 'ale': #eulerian ale lagrangian
+                pos[mask_f] += np.where(
+                    shepard_coeff[mask_f][:, None] > 0.8,
+                    v_mesh[mask_f],
+                    vel[mask_f]
+                      ) * dt
+            else :
+                pos[mask_f] += v_mesh[mask_f]* dt
+        
+        
+            if Periodic:
+                pos[:, 0] = pos[:, 0] % L
+                pos[:, 1] = pos[:, 1] % L  #only TGV testcase
+                
+                
+        if testCase == 'funnel': 
+            H = funnel_height(pos, types, FLUID, vertical_axis=1 )           
+            
+            time_history.append(t)   
+            H_history.append(H)
+            
+            Q, Cd = funnel_discharge_coefficient(
+                                 pos, vel, vol, types, FLUID,
+                                 np.array([0.0, 0.0]), # Centre de sortie approché (x, y)
+                                 R_bottom,
+                                 np.array([0.0, -1.0]),
+                                 g, H)
+            
+            Cd_history.append(Cd)
+            Q_history.append(Q)      
+        
+        if testCase == 'DamBreak': 
+            # Calcul de l'énergie cinétique
+            kinetic_energy = 0.5 * np.sum(m[mask_f] * np.linalg.norm(vel[mask_f], axis=1)**2)
+            # Calcul de l'énergie potentielle
+            potential_energy = np.sum(m[mask_f] * g_acc * pos[mask_f, 1])
+            # Énergie mécanique totale
+            mechanical_energy = kinetic_energy + potential_energy
+            
+            time_history.append(t)   
+            E_history.append(mechanical_energy)
+            
+            
+            
+            
+    
+    if mode_RK == 2 :
+        accel1 = np.zeros((n_current,2))
+        drho1 = np.zeros(n_current)
+        accel2 = np.zeros((n_current,2))
+        drho2 = np.zeros(n_current)
+        v_mesh1 = np.zeros((n_current,2))
+        v_mesh2 = np.zeros((n_current,2))
+        
+        pres_star = np.zeros_like(pres)        
+        pos_star = pos.copy()        
+        vel_star = vel.copy()        # idem
+        rho_star = rho.copy()        # idem
+        vol_star = vol.copy()        # idem
+        shepard_coeff_star = np.zeros_like( shepard_coeff)
+        L_matrices_star =np.zeros((n_current, 2, 2))
+        p_ref= np.zeros(n_current)
+        cond_MLS= np.zeros(n_current)
+        
+         
+        # -------------------------------- STEP 1: PREDICTOR ---------------------------------------------------------------------------------
+        #---------------------------------------------------------------------------------------------------------------------  
+        # Paramètres de contrôle du Shifting Formulation type PST (Particle Shifting Technique)
+        v_mesh1, S_G_local, S_dist, grad_S_G, grad_S_dist = compute_v_mesh_full(pos, vel, vol, h, dt, 
+                                                                                  mesh_mode,shepard_coeff,tree,pairs )
+        #---------------------------------------------------------------------------------------------------------------------       
+        # Après tree_star, pairs_star :
+        if mode_p_refinement == 1:
+            grad_rho = compute_mls_gradients(pos, vol, rho,  h, tree,p_ref,cond_MLS)
+            grad_vel = compute_mls_gradients(pos, vol, vel,  h, tree,p_ref,cond_MLS)
+            grad_p   = compute_mls_gradients(pos, vol, pres, h, tree,p_ref,cond_MLS)
+        
+        drho1, accel1 = compute_derivatives(pos, vel, rho, pres,vol, m,accel, drho,types, h, dt,shepard_coeff,
+                                                wall_normals,
+                                                v_mesh1, tree,pairs, L_matrices)    
+        #---------------------------------------------------------------------------------------------------------------------         
+        if np.any(mask_f):
+            rho_star[mask_f] = rho[mask_f] + drho1[mask_f] * dt
+            vel_star[mask_f] = vel[mask_f] + (accel1[mask_f] + g )* dt
+            vol_star[mask_f] = m[mask_f] / rho_star[mask_f]
+            if mesh_mode == 'ale': #eulerian ale lagrangian
+                pos_star[mask_f] +=np.where(
+                    shepard_coeff[mask_f][:, None] > 0.8,
+                    (v_mesh1[mask_f]),
+                    vel[mask_f]
+                      ) * dt
+            else :
+                pos_star[mask_f] += (v_mesh1[mask_f])* dt
+        pres_star=get_pressure(rho_star)
+        #recalcul des voisins    
+        tree_star, pairs_star = update_neighborhood(pos_star,h)
+        if mode_p_refinement == 1:
+            grad_rho = compute_mls_gradients(pos_star, vol_star, rho_star, h, tree_star,p_ref,cond_MLS)
+            grad_vel = compute_mls_gradients(pos_star, vol_star, vel_star, h, tree_star,p_ref,cond_MLS)
+            grad_p   = compute_mls_gradients(pos_star, vol_star, pres_star, h, tree_star,p_ref,cond_MLS)
+        
+        #recalcul de shepard
+        # --- PHASE  : CALCUL DU CHAMP DE SUPPORT (SHEPARD) --- 
+        # On fait un premier passage uniquement pour le voisinage et le shepard  
+        shepard_coeff_star[:] = kernel_cubic(0,h)*vol_star[:]              
+        compute_shepard_coefficients(pairs_star, pos_star, vol_star, h,
+                                        shepard_coeff_star,
+                                        num_neighbors,  #attention à mettre en star
+                                        kernel_cubic)
+        if RenormON:            
+            cond_array_star, renorm_status_star = compute_renormalization_matrices_robust(pairs_star, pos_star, vol_star, h, shepard_coeff_star, L_matrices_star)  
+        
+       # ----- Compute pressure wall or bodyF or car ---- 
+        solid_types = [WALL]
+        if 'CAR' in globals():
+            solid_types.append(CAR)
+        if 'BODY' in globals():
+            solid_types.append(BODY)
+
+        mask_wall = np.isin(types, solid_types)
+
+        pres_star[mask_wall] = 0.0
+        compute_pressure_wall(pairs_star, pos_star, vol_star, h, kernel_cubic, pres_star, types, g, rho0)
+        # ------------------------------- STEP 2: CORRECTOR ---------------------------------------------------------------------------------
+        # Paramètres de contrôle du Shifting Formulation type PST (Particle Shifting Technique)
+        v_mesh2, S_G_local, S_dist, grad_S_G, grad_S_dist = compute_v_mesh_full(pos_star, vel_star, vol_star, h, dt, 
+                                                                                  mesh_mode,shepard_coeff_star,tree_star,pairs_star)
+        #---------------------------------------------------------------------------------------------------------------------  
+        # CORRIGÉ : On passe np.zeros_like au lieu des anciens accel/drho
+        drho2, accel2 = compute_derivatives(pos_star, vel_star, rho_star, pres_star,
+                                                vol_star, m,
+                                                np.zeros_like(accel), np.zeros_like(drho),
+                                                types, h, dt, shepard_coeff_star, wall_normals, v_mesh2, tree_star, pairs_star,L_matrices_star)
+        
+        #---------------------------------------------------------------------------------------------------------------------         
+       # Moyenne des deux pentes              
+        if np.any(mask_f):
+            rho[mask_f] +=0.5* (drho1[mask_f]+drho2[mask_f])* dt
+            vol[mask_f] = m[mask_f] / rho[mask_f]
+            vel[mask_f] += 0.5*(accel1[mask_f] + accel2[mask_f])*dt +g*dt
+            pres[mask_f] = get_pressure(rho[mask_f])
+            if mesh_mode == 'ale': #eulerian ale lagrangian
+                pos[mask_f] += np.where(
+                    shepard_coeff[mask_f][:, None] > 0.8,
+                    0.5*(v_mesh1[mask_f]+v_mesh2[mask_f]),
+                    vel[mask_f]
+                      ) * dt
+            else :
+                pos[mask_f] +=0.5*(v_mesh1[mask_f]+v_mesh2[mask_f])* dt
+
+            if Periodic:
+                pos[:, 0] = pos[:, 0] % L
+                pos[:, 1] = pos[:, 1] % L  #only TGV testcase
+                
+        if testCase == 'car' :            
+            car_vel, car_omega= update_car_rigid_body(   pos, vel, accel, m, types,dt, car_vel,
+                                    car_omega,car_mass, car_I,  g)
+        if testCase == 'funnel': 
+            H = funnel_height(pos, types, FLUID, vertical_axis=1 )            
+            time_history.append(t)   
+            H_history.append(H)            
+            Q, Cd = funnel_discharge_coefficient(
+                                 pos, vel, vol, types, FLUID,
+                                 np.array([0.0, 0.0]), # Centre de sortie approché (x, y)
+                                 R_bottom,
+                                 np.array([0.0, -1.0]),
+                                 g, H)            
+            Cd_history.append(Cd)
+            Q_history.append(Q)      
+        
+        if testCase == 'DamBreak': 
+            # Calcul de l'énergie cinétique
+            kinetic_energy = 0.5 * np.sum(m[mask_f] * np.linalg.norm(vel[mask_f], axis=1)**2)
+            # Calcul de l'énergie potentielle
+            potential_energy = np.sum(m[mask_f] * g_acc * pos[mask_f, 1])
+            # Énergie mécanique totale
+            mechanical_energy = kinetic_energy + potential_energy
+            
+            time_history.append(t)   
+            E_history.append(mechanical_energy)
+#---------------------------------------------------------------------------------------------------------------------             
+    if testCase=='TGV' or testCase=='TGVmesh':
+        # Calcul de la fonctionnelle APRÈS déplacement
+        F1_after, FS_after, _, _, _ = compute_energy_functionals(
+            pos[mask_f], vol[mask_f], h, shepard_coeff[mask_f], pairs
+        )
+        F2_after = F1_after + alpha * FS_after
+
+        # Vérification de la décroissance
+        if F2_after > F2_before * (1.0 + 1e-6):  # tolérance numérique
+            # Backtracking : réduire beta_geom de moitié
+            beta_geom *= 0.5
+            print(f"[WARNING] F2 non décroissante : {F2_before:.4e} → {F2_after:.4e}. β réduit à {beta_geom:.4e}")
+        else:
+            delta_F2 = F2_before - F2_after
+            if step % save == 0:
+                print(f"F1={F1_after:.4e} | FS={FS_after:.4e} | F2={F2_after:.4e} | ΔF2={delta_F2:.4e}")
+    
+    
+    
+    
+    
+    # Sortie & Update Time acoustic constrained
+    fluid_vel = vel[mask_f]
+    fluid_pres = pres[mask_f]
+
+    max_v = np.max(np.linalg.norm(fluid_vel, axis=1)) if fluid_vel.size else 0
+    max_p = np.max(np.abs(fluid_pres)) if fluid_pres.size else 0
+    #if viscosity on 
+    max_set = max(c0, max_v, np.sqrt(max_p / rho0))
+    dt = CFL * h / max_set
+    
+    if testCase == 'bodyF':
+        dt = CFL * h / max(c0, max_v, np.sqrt(max_p / rho0))
+    if testCase == 'car':
+        dt = CFL * h / max(c0, max_v, np.sqrt(max_p / rho0), carvitesse)
+        
+    if mesh_mode == 'ale' :
+        max_v_mesh = np.max(np.linalg.norm(v_mesh[mask_f], axis=1)) if np.any(mask_f) else 0
+        dt = CFL * h / (c0 + max_v_mesh)
+        
+    if ViscoONOFF:
+        # 2. dt visqueux (Morris condition)
+        dt_viscous = 0.125 * (rho0 * h**2) / (mu + 1e-12)
+        dt = min(dt,dt_viscous)
+    #--------------------------------------------------------------------------------------------------------------------- 
+    #----------------------------------  Visualisations          ---------------------------------------------------------- 
+    #---------------------------------------------------------------------------------------------------------------------       
+    if testCase == 'jet':
+        pos[types>2] += vel[types>2]*dt
+        if DOUBLE_JET:
+            wall_normals  = np.zeros((n_current, 2))
+    
+   
+        
+    shepard_visual = np.where(shepard_coeff > 1e-12, shepard_coeff, 0.0)
+    # Calcul du nombre de particules fluides
+    n_fluid = np.sum(mask_f)
+    total_mass = np.sum(m[mask_f])
+    # Calcul de l'énergie cinétique
+    kinetic_energy = 0.5 * np.sum(m[mask_f] * np.linalg.norm(vel[mask_f], axis=1)**2)
+    # Calcul de l'énergie potentielle
+    potential_energy = np.sum(m[mask_f] * g_acc * pos[mask_f, 1])
+    # Énergie mécanique totale
+    mechanical_energy = kinetic_energy + potential_energy   
+    #-----------------------------------SAVE STEP----------------------------------------------------------------------     
+    if step % save == 0:
+        if mode_p_refinement == 0:
+             grad_p = np.zeros((n_current,2))
+             grad_vel = np.zeros((n_current, 2, 2))
+             grad_rho = np.zeros((n_current,2))
+             p_ref=np.zeros(n_current)
+             cond_MLS=np.zeros(n_current)
+            
+        write_vtk(os.path.join(vtk_dir, f"testcase{step:05d}.vtk"), pos, vel,v_mesh-vel , pres, types, rho,
+                  vol, m, num_neighbors, shepard_coeff,wall_normals, S_G_local, S_dist, grad_S_G, grad_S_dist, cond_array, renorm_status, grad_p, grad_vel,grad_rho,p_ref,cond_MLS)
+        print(f"Step {step} | t = {t:.4f}s | dt = {dt:.6e} | nombre de particules = {n_fluid:.6e}")
+        print(f"Total Mass: {np.sum(m[mask_f]):.6e}, Total Volume: {np.sum(vol[mask_f]):.6e}, Mechanical Energy: {mechanical_energy:.6e}")
+        #print(f"Reynolds (Exit): {reynolds_exit:.1f} | Reynolds (Max): {reynolds_max:.1f}")
+    #--------------------------------------------------------------------------------------------------------------------- 
+    if testCase=='TGV' or testCase=='TGVmesh': 
+        E = np.sum(0.5 * rho * np.sum(vel**2,axis=1) * vol)  
+        if step % save == 0:
+            v_ana_f, _ = get_tgv_solution(pos[:n], t, L, U0, nu)
+            err = np.sqrt(np.sum((vel[:n] - v_ana_f)**2) / np.sum(v_ana_f**2))
+            print("E=",E)
+            #print(f"Step {step:04d} | Mode: {mesh_mode} | L2 Error: {err:.4e} | S_G_mean: {np.mean(S_G_local):.6e} | S_dist: {S_dist:.6e}")
+            print(f"Step {step:04d} | Mode: {mesh_mode} | L2 Error debug: {err:.4e} ")
+        if abs(t - t_star) < 0.5*dt:
+            v_ana_f, _ = get_tgv_solution(pos[:n], t, L, U0, nu)
+            err = np.sqrt(np.sum(vol[:n] * np.sum((vel[:n]-v_ana_f)**2, axis=1)) /
+                          np.sum(vol[:n] * np.sum(v_ana_f**2, axis=1)))
+            print("E=",E)
+            #print(f"Step {step:04d} | Mode: {mesh_mode} | L2 Error: {err:.4e} | S_G_mean: {np.mean(S_G_local):.6e} | S_dist: {S_dist:.6e}")
+            print(f"Step {step:04d} | Mode: {mesh_mode} | L2 Error convergence: {err:.4e} ")
+    
+    #-----------------------------------CLEANING----------------------------------------------------------------------
+    # Suppression des particules sorties (ex: y < -0.2m)
+    if testCase == 'funnel':
+        keep = pos[:, 1] > -0.005
+        if not np.all(keep):
+            num_neighbors=num_neighbors[keep]
+            shepard_coeff=shepard_coeff[keep]
+            cond_array=cond_array[keep]
+            renorm_status=renorm_status[keep]
+            pos = pos[keep]
+            vel = vel[keep]
+            v_mesh = v_mesh[keep]
+            types = types[keep]
+            rho = rho[keep]
+            pres = pres[keep]
+            m = m[keep]
+            vol = vol[keep]
+            # Important : Mettre à jour n_p pour le calcul des masques au prochain step
+            n_p = len(pos)     
+       
+   
+    if testCase == 'jet':    
+        keep = (pos[:,1]>-1) & (pos[:,1]<1) & (pos[:,0]>-1) & (pos[:,0]<1.0)
+        if not np.all(keep):
+            pos=pos[keep]; vel=vel[keep]; types=types[keep]
+            rho=rho[keep]; pres=pres[keep]; vol=vol[keep]; m=m[keep]
+            num_neighbors=num_neighbors[keep]; shepard_coeff=shepard_coeff[keep]
+    #---------------------------------------------------------------------------------------------------------------------         
+    
+    if testCase == 'bodyF':
+        # ------------------------------------------------------------------
+        # 8j. Enregistrement des données (sondes et corps)
+        # ------------------------------------------------------------------
+        eta1 = measure_surface_elevation(pos, types, rho, rho0, x_probe1, h)
+        eta2 = measure_surface_elevation(pos, types, rho, rho0, x_probe2, h)
+
+        probe_t.append(t)
+        probe_eta1.append(eta1)
+        probe_eta2.append(eta2)
+        body_heave.append(body_cm[1] - y_body_init)
+        body_sway.append(body_cm[0]  - x_body_init)
+        body_roll.append(np.degrees(body_theta))
+        body_cm_hist.append(body_cm.copy())
+
+        # ------------------------------------------------------------------
+        # 8k. Sorties VTK et console
+        # ------------------------------------------------------------------
+        if step % save == 0:
+            fname = os.path.join(vtk_dir, f"WaveFloat{step:05d}.vtk")
+            write_vtk_wf(fname, pos, vel, v_mesh - vel, pres, types,
+                         rho, vol, m, num_neighbors, shepard_coeff, wall_normals,
+                         body_cm, body_theta, body_vel, body_omega)
+
+            theta_deg = np.degrees(flap_angle(t))
+            print(f"Step {step:5d} | t={t:6.3f}s | dt={dt:.2e} | "
+                  f"θ_clap={theta_deg:+.2f}° | "
+                  f"Heave={body_heave[-1]*100:+.2f}cm | "
+                  f"Sway={body_sway[-1]*100:+.2f}cm | "
+                  f"Roll={body_roll[-1]:+.2f}°")
+    
+    
+    
+    t += dt; step += 1
+    
+    
+    
+    
+if testCase=='bodyF':
+    # ==============================================================================
+    # 9.  POST-TRAITEMENT ET COMPARAISON EXPÉRIMENTALE
+    # ==============================================================================
+
+    print("\n" + "="*60)
+    print("  POST-TRAITEMENT")
+    print("="*60)
+
+    t_arr    = np.array(probe_t)
+    eta1_arr = np.array(probe_eta1)
+    eta2_arr = np.array(probe_eta2)
+    heave_arr = np.array(body_heave)
+    sway_arr  = np.array(body_sway)
+    roll_arr  = np.array(body_roll)
+    cm_arr    = np.array(body_cm_hist)
+
+    # Écriture des fichiers ASCII
+    write_probe_ascii(vtk_dir, t_arr, eta1_arr, eta2_arr,
+                      heave_arr, sway_arr, roll_arr, cm_arr)
+
+    # Figures de comparaison
+    plot_comparison(vtk_dir, t_arr, eta1_arr, eta2_arr,
+                    heave_arr, sway_arr, roll_arr, exp_data)
+
+    # Statistiques de synthèse
+    print(f"\n--- Résumé statistiques ---")
+    print(f"Heave max        : {np.max(np.abs(heave_arr))*100:.2f} cm")
+    print(f"Sway max         : {np.max(np.abs(sway_arr))*100:.2f} cm")
+    print(f"Roll max         : {np.max(np.abs(roll_arr)):.2f}°")
+    print(f"η max (sonde 1)  : {np.max(np.abs(eta1_arr))*100:.2f} cm")
+    print(f"η max (sonde 2)  : {np.max(np.abs(eta2_arr))*100:.2f} cm")
+    print(f"\nSimulation terminée. Résultats dans : {vtk_dir}/")
+
+if testCase == 'DamBreak':        
+    print("\n" + "="*60)
+    print("  POST-TRAITEMENT DamBreak - GÉNÉRATION DES COURBES")
+    print("="*60)
+
+    times = np.array(time_history)
+    E = np.array(E_history)
+    
+    
+    # Sécurité pour éviter la division par zéro
+    if len(E) > 0 and E[0] > 1e-6:
+        E = E / E[0]
+    else:
+        E = np.zeros_like(E)
+
+    # --- Définition des chemins explicites vers le dossier de simulation ---
+    path_E = os.path.join(vtk_dir, 'courbe_E_SPHIRIT.png')
+    
+
+    # --- Graphique 1 : Htilde ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, E, label='E/E0 SPHIRIT', lw=2)
+    plt.xlabel('Temps (s)')
+    plt.ylabel('E / E0')
+    plt.title('Évolution de l\'energie adimensionnée')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(path_E, dpi=300)
+    plt.close() 
+
+    print(f"✅ Fichiers PNG générés avec succès dans le dossier : {vtk_dir}")    
+    
+if testCase == 'funnel':        
+    print("\n" + "="*60)
+    print("  POST-TRAITEMENT FUNNEL - GÉNÉRATION DES COURBES")
+    print("="*60)
+
+    times = np.array(time_history)
+    H = np.array(H_history)
+    Q = np.array(Q_history)
+    Cd = np.array(Cd_history)
+    
+    # Sécurité pour éviter la division par zéro
+    if len(H) > 0 and H[0] > 1e-6:
+        Htilde = H / H[0]
+    else:
+        Htilde = np.zeros_like(H)
+
+    # --- Définition des chemins explicites vers le dossier de simulation ---
+    path_H = os.path.join(vtk_dir, 'courbe_Htilde_SPHIRIT.png')
+    path_Cd = os.path.join(vtk_dir, 'courbe_Cd_SPHIRIT.png')
+    path_Q = os.path.join(vtk_dir, 'courbe_Q_SPHIRIT.png')
+
+    # --- Graphique 1 : Htilde ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, Htilde, label='H/H0 SPHIRIT', lw=2)
+    plt.xlabel('Temps (s)')
+    plt.ylabel('H / H0')
+    plt.title('Évolution de la hauteur d\'eau adimensionnée')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(path_H, dpi=300)
+    plt.close() 
+
+    # --- Graphique 2 : Coefficient de décharge Cd ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, Cd, label='Cd (Coefficient de décharge)', color='green', lw=2)
+    plt.xlabel('Temps (s)')
+    plt.ylabel('Cd')
+    plt.title('Coefficient de décharge')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(path_Cd, dpi=300)
+    plt.close()
+
+    # --- Graphique 3 : Débit Q ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, Q, label='Débit SPHIRIT', color='red', lw=2)
+    plt.xlabel('Temps (s)')
+    plt.ylabel('Débit (m³/s)')
+    plt.title('Débit en sortie de l\'entonnoir')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(path_Q, dpi=300)
+    plt.close()
+
+    print(f"✅ Fichiers PNG générés avec succès dans le dossier : {vtk_dir}")
